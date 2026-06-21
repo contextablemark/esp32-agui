@@ -238,6 +238,14 @@ Advertised in `RunAgentInput.tools`; on `TOOL_CALL_*` the device executes locall
 | **P7** Tools | `set_timer` (idle countdown) + `set_alarm` (RTC) | agent sets a timer/alarm; result round-trips |
 | **P8** Hardening | NVS secrets + Soniox ephemeral keys, reconnect/backoff, PSRAM tuning, error states; then v2 tools | survives drops; no key on device |
 
+**Deferred / backlog (post-P8, "if we get to it"):**
+- **A2UI generative-UI rendering.** Observed 2026-06-21: the user's `home-agui-agent` drives the
+  screen via a `render_a2ui` TOOL_CALL carrying an [A2UI](https://a2ui.org) component tree
+  (e.g. `Column`>`Text` from `…/v0_9/basic_catalog.json`) and finishes the run with **no**
+  `TEXT_MESSAGE_CONTENT` — the reply text lives inside the A2UI spec. Rendering A2UI trees in LVGL is
+  a substantial UI layer. **Parked past v1**; P3–P8 target a `TEXT_*`-emitting agent. The agui_client
+  event router is left as-is (it already surfaces the tool call). Revisit if on-device A2UI proves worth it.
+
 ## 11. Risks / open questions
 - **Heap headroom** for one TLS session + LVGL + audio buffers — measure peak; keep buffers in PSRAM. (Sequential TLS avoids two concurrent sessions.)
 - **Soniox raw-PCM format** (`audio_format`/sample-rate field) — confirm against live docs.

@@ -295,9 +295,11 @@ void soniox_session_stop(void)
     esp_websocket_client_handle_t ws = s_ws;   // capture no longer touches s_ws
     s_ws = NULL;
     if (ws) {
-        if (esp_websocket_client_is_connected(ws))
-            esp_websocket_client_send_text(ws, "", 0, pdMS_TO_TICKS(500)); // end-of-audio
-        esp_websocket_client_close(ws, pdMS_TO_TICKS(1000));
+        // Close the socket directly (destroy() → TCP FIN). Deliberately do NOT send Soniox's
+        // empty end-of-audio frame here: that makes Soniox initiate a WS CLOSE, which the client
+        // echoes and then waits on a hardcoded 1 s TCP-close poll that logs "Did not get TCP close
+        // within expected delay" and stalls the stop. The turn is already committed (Soniox
+        // '<end>'), so a direct TCP close cleanly ends the session with no warning and no stall.
         esp_websocket_client_destroy(ws);
     }
     if (s_rx) { heap_caps_free(s_rx); s_rx = NULL; }

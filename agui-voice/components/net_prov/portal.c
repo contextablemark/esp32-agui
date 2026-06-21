@@ -37,8 +37,10 @@ static const char FORM[] =
     "<label>WiFi network (SSID)</label><input name=ssid autofocus>"
     "<label>WiFi password</label><input name=pass type=password>"
     "<label>Soniox API key</label><input name=soniox>"
+    "<label>AG-UI endpoint URL</label><input name=agui_url>"
+    "<label>AG-UI bearer token (optional)</label><input name=agui_token>"
     "<p style='color:#666;font-size:.85em'>Leave WiFi blank if already connected; "
-    "fill the Soniox key to enable voice.</p>"
+    "fill the Soniox key to enable voice and the AG-UI URL to enable the agent.</p>"
     "<button type=submit>Save &amp; connect</button></form></body></html>";
 
 // ---- tiny form helpers ---------------------------------------------------
@@ -101,7 +103,7 @@ static esp_err_t root_get(httpd_req_t *req)
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    char body[512];
+    char body[1280];   // holds all urlencoded fields (ssid/pass/soniox/agui_url/agui_token)
     int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int got = 0;
     while (got < total) {
@@ -112,9 +114,12 @@ static esp_err_t save_post(httpd_req_t *req)
     body[got] = '\0';
 
     char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
+    char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0};
     bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
     bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
-    if (!have_ssid && !have_soniox) {
+    bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
+    bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
+    if (!have_ssid && !have_soniox && !have_url && !have_token) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -122,9 +127,9 @@ static esp_err_t save_post(httpd_req_t *req)
         form_field(body, "pass", pass, sizeof(pass));
         net_creds_add(ssid, pass);
     }
-    if (have_soniox) {
-        app_cfg_set(APP_CFG_SONIOX_KEY, soniox);
-    }
+    if (have_soniox) app_cfg_set(APP_CFG_SONIOX_KEY, soniox);
+    if (have_url)    app_cfg_set(APP_CFG_AGUI_URL, agui_url);
+    if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,

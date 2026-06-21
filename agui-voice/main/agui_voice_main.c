@@ -1,9 +1,16 @@
 // AG-UI on-device voice client — application entry point.
-// P0/P0.5: WiFi (multi-SSID + captive portal). P1: streaming STT (Soniox) — speak and
-// watch the console for live transcripts. See docs/agui-voice-plan.md for the roadmap.
+// P0/P0.5: WiFi (multi-SSID + captive portal). P1: streaming STT (Soniox). P2: AG-UI client
+// (final transcript → POST RunAgentInput → stream SSE → reply text on serial). Turn-taking:
+// STT is paused while a run is in flight (sequential TLS, per the plan). See
+// docs/agui-voice-plan.md for the roadmap.
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -18,6 +25,8 @@
 
 static const char *TAG = "agui_voice";
 
+static QueueHandle_t s_turn_q;   // final transcripts (char*) → agent task
+
 static void init_nvs(void)
 {
     esp_err_t err = nvs_flash_init();
@@ -28,55 +37,113 @@ static void init_nvs(void)
     ESP_ERROR_CHECK(err);
 }
 
-// --- Soniox transcript callbacks (P1 test harness; fire from the websocket task) ---
+// --- Soniox transcript callbacks (fire from the websocket task; keep them fast) ---
 static void on_partial(const char *text, void *ctx)
 {
     ESP_LOGI("stt", "~ %s", text);          // live interim transcript
 }
 static void on_turn(const char *text, void *ctx)
 {
-    ESP_LOGI("stt", "TURN: %s", text);      // committed utterance (Soniox <end>)
+    if (!text) return;
+    while (*text == ' ' || *text == '\t') text++;   // ignore empty/whitespace turns
+    if (!*text) return;
+    char *dup = strdup(text);                // handed to the agent task
+    if (dup && xQueueSend(s_turn_q, &dup, 0) != pdTRUE) free(dup);   // drop if backlogged
+}
+
+// --- AG-UI run handlers (fire from the agent task) ---
+static void h_run_started(void *c)  { ESP_LOGI("agui", "thinking…"); printf("\nAI: "); fflush(stdout); }
+static void h_text_delta(const char *d, void *c) { printf("%s", d); fflush(stdout); }
+static void h_text_end(void *c)     { printf("\n"); fflush(stdout); }
+static void h_reasoning(const char *d, bool active, void *c) { if (d && *d) ESP_LOGI("agui", "reasoning: %s", d); }
+static void h_tool_call(const char *id, const char *name, const char *args, void *c)
+{ ESP_LOGI("agui", "TOOL_CALL %s (%s) args=%s", name, id, args); }
+static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); }
+static void h_error(const char *m, void *c) { ESP_LOGE("agui", "run error: %s", m); }
+
+static const agui_handlers_t s_handlers = {
+    .on_run_started  = h_run_started,
+    .on_text_delta   = h_text_delta,
+    .on_text_end     = h_text_end,
+    .on_reasoning    = h_reasoning,
+    .on_tool_call    = h_tool_call,
+    .on_run_finished = h_run_finished,
+    .on_error        = h_error,
+};
+
+// Pause STT, run one AG-UI turn (streams the reply), then resume STT. One run at a time.
+static void agent_task(void *arg)
+{
+    char url[APP_CFG_VAL_MAX], token[APP_CFG_VAL_MAX];
+    for (;;) {
+        char *text = NULL;
+        if (xQueueReceive(s_turn_q, &text, portMAX_DELAY) != pdTRUE || !text) continue;
+        ESP_LOGI(TAG, "You: %s", text);
+
+        if (!app_cfg_get(APP_CFG_AGUI_URL, url, sizeof url)) {
+            ESP_LOGW(TAG, "no AG-UI URL configured — skipping run");
+            free(text);
+            continue;
+        }
+        bool have_tok = app_cfg_get(APP_CFG_AGUI_TOKEN, token, sizeof token);
+
+        soniox_session_stop();               // free the STT TLS session for the duration of the run
+        agui_cfg_t acfg = {
+            .endpoint    = url,
+            .auth_bearer = have_tok ? token : NULL,
+            .thread_id   = NULL,             // client keeps a persistent threadId
+        };
+        agui_run(&acfg, text, NULL, NULL, NULL, &s_handlers, NULL);
+        free(text);
+
+        soniox_cfg_t scfg = { 0 };           // resume listening
+        if (soniox_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK)
+            ESP_LOGE(TAG, "failed to resume STT after run");
+    }
 }
 
 void app_main(void)
 {
-    ESP_LOGI(TAG, "AG-UI voice client booting (P0/P0.5/P1)");
+    ESP_LOGI(TAG, "AG-UI voice client booting (P0/P0.5/P1/P2)");
     init_nvs();
 
-    // Non-network components (stubs until later phases).
+    // Non-network components (UI/tools stubs until later phases).
     device_tools_init();
     chat_ui_init();
     agui_client_init();
 
-    // Provision until we have BOTH WiFi and a Soniox API key. The portal collects either
-    // (WiFi creds and/or the Soniox key); on first P1 boot WiFi is already saved but the
-    // key isn't, so the portal opens just to capture the key.
+    // Provision until we have WiFi + Soniox key + AG-UI URL. The portal collects any of them;
+    // on first P2 boot WiFi+key may already be saved, so it opens just to capture the AG-UI URL.
     ESP_ERROR_CHECK(net_prov_init());
     for (;;) {
         bool wifi_ok = net_is_connected() || (net_connect_saved(15000) == ESP_OK);
         bool key_ok  = app_cfg_has(APP_CFG_SONIOX_KEY);
-        if (wifi_ok && key_ok) break;
-        ESP_LOGW(TAG, "provisioning needed (wifi=%d, soniox_key=%d) — opening 'AMOLED-setup'",
-                 wifi_ok, key_ok);
+        bool url_ok  = app_cfg_has(APP_CFG_AGUI_URL);
+        if (wifi_ok && key_ok && url_ok) break;
+        ESP_LOGW(TAG, "provisioning needed (wifi=%d, soniox_key=%d, agui_url=%d) — opening 'AMOLED-setup'",
+                 wifi_ok, key_ok, url_ok);
         net_portal_start("AMOLED-setup");
         net_portal_wait_saved(0);   // block until the user submits the form
         net_portal_stop();
     }
     net_start_auto_reconnect();
-    ESP_LOGI(TAG, "network + Soniox key ready");
+    ESP_LOGI(TAG, "network + Soniox key + AG-UI URL ready");
 
-    // P1: start streaming STT. Continuous capture; Soniox endpoint-detection emits a turn
-    // ("<end>") per utterance. Speak into the mic and watch the 'stt' logs.
+    // P2: agent turn-taking. Final transcripts flow STT → queue → agent task → AG-UI run.
+    s_turn_q = xQueueCreate(4, sizeof(char *));
+    xTaskCreate(agent_task, "agui_agent", 12288, NULL, 5, NULL);   // TLS handshake runs on this stack
+
+    // Start streaming STT. Speak; Soniox endpoint-detection commits a turn ("<end>") which
+    // the agent task sends to the AG-UI agent and streams the reply on the console.
     if (soniox_client_init() == ESP_OK) {
         soniox_cfg_t scfg = { 0 };   // defaults; api_key read from NVS
-        if (soniox_session_start(&scfg, on_partial, on_turn, NULL) == ESP_OK) {
+        if (soniox_session_start(&scfg, on_partial, on_turn, NULL) == ESP_OK)
             ESP_LOGI(TAG, "Soniox session started — speak into the mic");
-        } else {
+        else
             ESP_LOGE(TAG, "Soniox session failed to start");
-        }
     }
 
-    // Heartbeat: keeps the USB-Serial/JTAG console showing live output and reports link/heap.
+    // Heartbeat: keeps the console alive and reports link/heap.
     char ip[16];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));
