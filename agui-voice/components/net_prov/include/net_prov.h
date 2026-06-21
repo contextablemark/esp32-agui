@@ -1,0 +1,46 @@
+// net_prov — WiFi connectivity + provisioning.
+//
+// Primary: multi-SSID list stored in NVS, tried with early-abort (pattern adapted from
+// app-pixels/ai-chat wifi_try_connect(), ported to esp_wifi/esp_netif).
+// Fallback (P0.5): SoftAP "AMOLED-setup" captive portal to enter creds from a phone.
+// See docs/agui-voice-plan.md §5.5.
+#pragma once
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include "esp_err.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// One-time init (NVS netif/event loop wiring). Safe to call once from app_main.
+esp_err_t net_prov_init(void);
+
+// Primary connect: try each saved network in turn, early-abort on auth-fail / no-AP,
+// per-network timeout. Returns ESP_OK on first successful association.
+esp_err_t net_connect_saved(uint32_t per_net_timeout_ms);
+
+bool net_is_connected(void);
+
+// Format the current STA IPv4 into buf (e.g. "192.168.1.42"). Returns false if offline.
+bool net_get_ip_str(char *buf, size_t len);
+
+// Start auto-reconnect with backoff for mid-session drops.
+void net_start_auto_reconnect(void);
+
+// NVS credential list management.
+esp_err_t net_creds_add(const char *ssid, const char *pass);
+esp_err_t net_creds_clear(void);
+
+// Fallback provisioning (P0.5): SoftAP + captive-portal web form + DNS catch-all.
+esp_err_t net_portal_start(const char *ap_ssid);
+void      net_portal_stop(void);
+// Block until the user submits credentials via the portal (saved to NVS), or timeout.
+// Returns true if credentials were saved.
+bool      net_portal_wait_saved(uint32_t timeout_ms);
+
+#ifdef __cplusplus
+}
+#endif
