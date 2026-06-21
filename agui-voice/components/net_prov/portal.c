@@ -2,6 +2,7 @@
 // catch-all so phones auto-open the page. User submits SSID/pass → saved to NVS.
 
 #include "net_prov.h"
+#include "app_cfg.h"
 
 #include <string.h>
 #include <sys/socket.h>
@@ -31,10 +32,13 @@ static const char FORM[] =
     "<style>body{font-family:sans-serif;margin:2em;max-width:30em}"
     "input{display:block;width:100%;padding:.6em;margin:.4em 0;font-size:1em}"
     "button{padding:.7em 1.2em;font-size:1em}</style></head><body>"
-    "<h2>AG-UI device WiFi</h2>"
+    "<h2>AG-UI device setup</h2>"
     "<form method=POST action=/save>"
-    "<label>Network (SSID)</label><input name=ssid autofocus>"
-    "<label>Password</label><input name=pass type=password>"
+    "<label>WiFi network (SSID)</label><input name=ssid autofocus>"
+    "<label>WiFi password</label><input name=pass type=password>"
+    "<label>Soniox API key</label><input name=soniox>"
+    "<p style='color:#666;font-size:.85em'>Leave WiFi blank if already connected; "
+    "fill the Soniox key to enable voice.</p>"
     "<button type=submit>Save &amp; connect</button></form></body></html>";
 
 // ---- tiny form helpers ---------------------------------------------------
@@ -75,7 +79,7 @@ static bool form_field(const char *body, const char *name, char *out, size_t out
             p += kl;
             const char *end = strchr(p, '&');
             size_t len = end ? (size_t)(end - p) : strlen(p);
-            char raw[128];
+            char raw[256];
             if (len >= sizeof(raw)) len = sizeof(raw) - 1;
             memcpy(raw, p, len);
             raw[len] = '\0';
@@ -97,7 +101,7 @@ static esp_err_t root_get(httpd_req_t *req)
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    char body[256];
+    char body[512];
     int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int got = 0;
     while (got < total) {
@@ -107,18 +111,25 @@ static esp_err_t save_post(httpd_req_t *req)
     }
     body[got] = '\0';
 
-    char ssid[33] = {0}, pass[65] = {0};
-    if (!form_field(body, "ssid", ssid, sizeof(ssid)) || ssid[0] == '\0') {
-        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ssid");
+    char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
+    bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
+    bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
+    if (!have_ssid && !have_soniox) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
-    form_field(body, "pass", pass, sizeof(pass));
-    net_creds_add(ssid, pass);
+    if (have_ssid) {
+        form_field(body, "pass", pass, sizeof(pass));
+        net_creds_add(ssid, pass);
+    }
+    if (have_soniox) {
+        app_cfg_set(APP_CFG_SONIOX_KEY, soniox);
+    }
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_sendstr(req,
         "<html><body style='font-family:sans-serif;margin:2em'>"
-        "<h3>Saved.</h3><p>The device is connecting now. You can close this page.</p>"
+        "<h3>Saved.</h3><p>The device is applying settings now. You can close this page.</p>"
         "</body></html>");
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
     return ESP_OK;

@@ -4,6 +4,7 @@ idf_component_register(
     REQUIRES
         nvs_flash
         net_prov
+        app_cfg
         soniox_client
         agui_client
         device_tools
