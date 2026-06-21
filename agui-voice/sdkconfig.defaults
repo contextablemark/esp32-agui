@@ -8,6 +8,14 @@ CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 # TLS root certs for WSS (Soniox) / HTTPS — full bundle covers their CA chain.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# Force dual-cert servers (notably ngrok) onto their RSA certificate. The device's TLS 1.2
+# ECDSA-cert handshake fails against ngrok's edge (mbedTLS CONN_EOF / -0x7280 immediately after
+# "Certificate validated"), while the RSA path is proven good (Soniox, Railway, and ngrok from a
+# desktop client). Disabling the two ECDSA key-exchange methods makes the client offer only
+# RSA-cert ciphersuites, so ngrok serves its RSA cert. ECDSA *certificate verification* is
+# unaffected (still enabled via MBEDTLS_ECDSA_C). Revisit if a target ever needs an ECDSA-only TLS server.
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA=n
+CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA=n
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
