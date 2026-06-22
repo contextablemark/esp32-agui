@@ -67,21 +67,52 @@ static void on_turn(const char *text, void *ctx)             // Soniox endpoint 
 }
 
 // --- AG-UI run handlers (fire from the ptt task during agui_run) ---
-static bool s_assist_started;          // assistant bubble created yet for this run?
+// They drive the chat bubbles (TEXT_*) and the ephemeral status line (RUN_*/REASONING_*/
+// TOOL_CALL_*) — P4 live agent activity: status shows what the agent is doing and clears
+// when the reply text starts streaming.
+static bool s_assist_started;          // assistant bubble open for the current message?
+static bool s_run_error;               // run ended in error → keep the "Error" status visible
 
-static void h_run_started(void *c)  { ESP_LOGI("agui", "thinking..."); printf("\nAI: "); fflush(stdout); }
+static void h_run_started(void *c)
+{
+    ESP_LOGI("agui", "thinking...");
+    chat_ui_status("Thinking...");
+    printf("\nAI: "); fflush(stdout);
+}
 static void h_text_delta(const char *d, void *c)
 {
-    if (!s_assist_started) { chat_ui_begin_assistant(); s_assist_started = true; }
+    if (!s_assist_started) {                 // first delta of this message → open a bubble…
+        chat_ui_begin_assistant();
+        chat_ui_status("");                  // …and clear the reasoning/tool indicator
+        s_assist_started = true;
+    }
     chat_ui_append_assistant(d);
     printf("%s", d); fflush(stdout);
 }
-static void h_text_end(void *c)     { printf("\n"); fflush(stdout); }
-static void h_reasoning(const char *d, bool active, void *c) { if (d && *d) ESP_LOGI("agui", "reasoning: %s", d); }
+static void h_text_end(void *c)
+{
+    s_assist_started = false;                // message done → the next TEXT_MESSAGE gets its own bubble
+    printf("\n"); fflush(stdout);
+}
+static void h_reasoning(const char *d, bool active, void *c)
+{
+    if (active) chat_ui_status("Reasoning...");   // ephemeral; cleared when the reply text starts
+    if (d && *d) ESP_LOGI("agui", "reasoning: %s", d);
+}
 static void h_tool_call(const char *id, const char *name, const char *args, void *c)
-{ ESP_LOGI("agui", "TOOL_CALL %s (%s) args=%s", name, id, args); }
+{
+    char s[96];
+    snprintf(s, sizeof s, "Using %s...", (name && *name) ? name : "tool");
+    chat_ui_status(s);                       // transient chip; the next event overwrites it
+    ESP_LOGI("agui", "TOOL_CALL %s (%s) args=%s", name, id, args);
+}
 static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); }
-static void h_error(const char *m, void *c) { ESP_LOGE("agui", "run error: %s", m); chat_ui_status("Error"); }
+static void h_error(const char *m, void *c)
+{
+    ESP_LOGE("agui", "run error: %s", m);
+    chat_ui_status("Error");
+    s_run_error = true;
+}
 
 static const agui_handlers_t s_handlers = {
     .on_run_started  = h_run_started,
@@ -108,9 +139,11 @@ static void run_agent_turn(const char *text)
     bool have_tok = app_cfg_get(APP_CFG_AGUI_TOKEN, token, sizeof token);
 
     s_assist_started = false;
+    s_run_error      = false;
     chat_ui_status("Thinking...");
     agui_cfg_t acfg = { .endpoint = url, .auth_bearer = have_tok ? token : NULL, .thread_id = NULL };
     agui_run(&acfg, text, NULL, NULL, NULL, &s_handlers, NULL);
+    if (!s_run_error) chat_ui_status(IDLE_HINT);   // success → idle prompt; on error keep "Error" up
 }
 
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
@@ -140,8 +173,8 @@ static void ptt_task(void *arg)
             while (*t == ' ' || *t == '\t') t++;
             size_t n = strlen(t);
             while (n && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n')) t[--n] = '\0';
-            if (*t) run_agent_turn(t);
-            chat_ui_status(IDLE_HINT);
+            if (*t) run_agent_turn(t);             // owns its terminal status (idle hint / "Error")
+            else    chat_ui_status(IDLE_HINT);
 
         } else if (ev == 2 && !s_listening) {      // DOUBLE-TAP → reopen setup portal (change endpoint etc.)
             chat_ui_status("Setup: join 'AMOLED-setup'");
