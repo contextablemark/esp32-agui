@@ -619,8 +619,12 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             .rotation = ESP_LV_ADAPTER_ROTATE_0,
             .hor_res = BSP_LCD_H_RES,
             .ver_res = BSP_LCD_V_RES,
-            .buffer_height = 50,
-            .use_psram = true,
+            // Draw buffers in INTERNAL DMA-capable RAM (allocated once at init), not PSRAM: a
+            // PSRAM draw buffer forces the QSPI flush to allocate a per-transfer internal bounce
+            // buffer, which fails (ESP_ERR_NO_MEM "Draw bitmap failed") once WiFi/TLS/audio claim
+            // internal RAM. Smaller height keeps the 2× double buffer lean (~44 KB internal).
+            .buffer_height = 30,
+            .use_psram = false,
             .enable_ppa_accel = false,
             .require_double_buffer = true,
         },

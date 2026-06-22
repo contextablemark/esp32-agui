@@ -41,6 +41,7 @@ static void init_nvs(void)
 static void on_partial(const char *text, void *ctx)
 {
     ESP_LOGI("stt", "~ %s", text);          // live interim transcript
+    chat_ui_status(text);                    // live feedback in the status line
 }
 static void on_turn(const char *text, void *ctx)
 {
@@ -52,14 +53,21 @@ static void on_turn(const char *text, void *ctx)
 }
 
 // --- AG-UI run handlers (fire from the agent task) ---
+static bool s_assist_started;   // has the assistant bubble been created for this run yet?
+
 static void h_run_started(void *c)  { ESP_LOGI("agui", "thinking…"); printf("\nAI: "); fflush(stdout); }
-static void h_text_delta(const char *d, void *c) { printf("%s", d); fflush(stdout); }
+static void h_text_delta(const char *d, void *c)
+{
+    if (!s_assist_started) { chat_ui_begin_assistant(); s_assist_started = true; }  // lazily, on first text
+    chat_ui_append_assistant(d);
+    printf("%s", d); fflush(stdout);
+}
 static void h_text_end(void *c)     { printf("\n"); fflush(stdout); }
 static void h_reasoning(const char *d, bool active, void *c) { if (d && *d) ESP_LOGI("agui", "reasoning: %s", d); }
 static void h_tool_call(const char *id, const char *name, const char *args, void *c)
 { ESP_LOGI("agui", "TOOL_CALL %s (%s) args=%s", name, id, args); }
-static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); }
-static void h_error(const char *m, void *c) { ESP_LOGE("agui", "run error: %s", m); }
+static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); chat_ui_status("Ready"); }
+static void h_error(const char *m, void *c) { ESP_LOGE("agui", "run error: %s", m); chat_ui_status("Error"); }
 
 static const agui_handlers_t s_handlers = {
     .on_run_started  = h_run_started,
@@ -79,14 +87,18 @@ static void agent_task(void *arg)
         char *text = NULL;
         if (xQueueReceive(s_turn_q, &text, portMAX_DELAY) != pdTRUE || !text) continue;
         ESP_LOGI(TAG, "You: %s", text);
+        chat_ui_add_user(text);
 
         if (!app_cfg_get(APP_CFG_AGUI_URL, url, sizeof url)) {
             ESP_LOGW(TAG, "no AG-UI URL configured — skipping run");
+            chat_ui_status("No AG-UI URL");
             free(text);
             continue;
         }
         bool have_tok = app_cfg_get(APP_CFG_AGUI_TOKEN, token, sizeof token);
 
+        s_assist_started = false;            // fresh assistant bubble for this run
+        chat_ui_status("Thinking…");
         soniox_session_stop();               // free the STT TLS session for the duration of the run
         agui_cfg_t acfg = {
             .endpoint    = url,

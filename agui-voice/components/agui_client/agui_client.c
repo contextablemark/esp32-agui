@@ -176,7 +176,14 @@ static void sse_dispatch(run_t *r, const char *json)
     cJSON *ev = cJSON_Parse(json);
     if (!ev) { ESP_LOGW(TAG, "unparseable SSE event"); return; }
     cJSON *jt = cJSON_GetObjectItem(ev, "type");
-    if (cJSON_IsString(jt) && jt->valuestring) route(r, jt->valuestring, ev);
+    if (cJSON_IsString(jt) && jt->valuestring) {
+        const char *t = jt->valuestring;
+        if (strcmp(t, "TEXT_MESSAGE_CONTENT") != 0)   // (skip per-delta spam) log the event sequence
+            ESP_LOGI(TAG, "event: %s", t);
+        if (!strcmp(t, "RUN_FINISHED") || !strcmp(t, "RUN_ERROR"))
+            ESP_LOGI(TAG, "  payload: %.400s", json); // does RUN_FINISHED carry a result/outcome?
+        route(r, t, ev);
+    }
     cJSON_Delete(ev);
 }
 

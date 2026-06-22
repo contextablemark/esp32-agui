@@ -5,6 +5,9 @@ CONFIG_IDF_TARGET="esp32s3"
 # Route the console to the chip's native USB (USB Serial/JTAG) — that's what the board's
 # USB-C exposes (VID 0x303a/PID 0x1001), not UART0. Lets ESP_LOG show over USB-C.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+# app_main builds the LVGL chat UI (chat_ui_init) on the main task — the 3.5K default stack
+# overflows during LVGL widget creation/layout. Give it room.
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # TLS root certs for WSS (Soniox) / HTTPS — full bundle covers their CA chain.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
@@ -34,7 +37,7 @@ CONFIG_LV_COLOR_16_SWAP=y
 CONFIG_LV_COLOR_SCREEN_TRANSP=y
 CONFIG_LV_MEM_CUSTOM=y
 CONFIG_LV_MEMCPY_MEMSET_STD=y
-CONFIG_LV_USE_PERF_MONITOR=y
+CONFIG_LV_USE_PERF_MONITOR=n
 CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
 CONFIG_LV_FONT_MONTSERRAT_12=y
 CONFIG_LV_FONT_MONTSERRAT_16=y
