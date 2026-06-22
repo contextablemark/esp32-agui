@@ -21,6 +21,7 @@ static const char *TAG = "chat_ui";
 #define COL_USER      0x2563EB   // blue
 #define COL_ASSIST    0x2C2C2E   // dark grey
 #define MAX_BUBBLES   30         // prune oldest rows beyond this
+#define CHAT_FONT     (&lv_font_montserrat_18)   // bubbles + status line (one place to retune)
 
 static lv_obj_t *s_chat;         // scrollable flex column of message rows
 static lv_obj_t *s_status;       // top status label
@@ -63,7 +64,7 @@ static void apply_wrapped(lv_obj_t *lbl, const char *text)
     char clean[2048];
     sanitize(text ? text : "", clean, sizeof clean);
     lv_point_t sz;
-    lv_txt_get_size(&sz, clean[0] ? clean : " ", &lv_font_montserrat_16, 0, 0, LBL_MAXW, LV_TEXT_FLAG_NONE);
+    lv_txt_get_size(&sz, clean[0] ? clean : " ", CHAT_FONT, 0, 0, LBL_MAXW, LV_TEXT_FLAG_NONE);
     lv_obj_set_width(lbl, sz.x);
     lv_label_set_text(lbl, clean);
 }
@@ -102,7 +103,7 @@ static lv_obj_t *add_bubble(bool user, uint32_t color, const char *text)
     lv_obj_t *lbl = lv_label_create(bub);
     lv_label_set_long_mode(lbl, LV_LABEL_LONG_WRAP);
     lv_obj_set_style_text_color(lbl, lv_color_white(), 0);
-    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(lbl, CHAT_FONT, 0);
     apply_wrapped(lbl, text);       // bounds width → wraps; sanitizes punctuation
     return lbl;
 }
@@ -128,7 +129,7 @@ esp_err_t chat_ui_init(void)
     s_status = lv_label_create(box);
     lv_label_set_long_mode(s_status, LV_LABEL_LONG_CLIP);   // one line, full content width, no dots
     lv_obj_set_style_text_color(s_status, lv_palette_main(LV_PALETTE_GREY), 0);
-    lv_obj_set_style_text_font(s_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_font(s_status, CHAT_FONT, 0);
     lv_obj_set_pos(s_status, 0, 7);
     lv_label_set_text(s_status, "Ready");
 
