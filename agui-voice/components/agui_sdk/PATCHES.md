@@ -14,6 +14,10 @@ Re-sync: copy `sdks/community/c++/src` over `agui_sdk/src` at a newer commit, th
 deltas below (all are marked with a `// [device]` comment in-tree, so `grep -rn "\[device\]" src`
 lists them).
 
+**After re-syncing, run the host tests:** `test/run_host_tests.sh` (plain g++, no ESP-IDF/hardware)
+round-trips the REASONING_* / interrupt / resume extensions and fails loudly if a delta was dropped
+or upstream changed a field/shape. Run it before trusting a re-synced snapshot.
+
 ## Deltas from upstream
 
 ### A. Transport: libcurl removed (ESP-IDF uses esp_http_client)
