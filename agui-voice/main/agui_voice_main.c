@@ -143,12 +143,13 @@ void app_main(void)
             ESP_LOGE(TAG, "Soniox session failed to start");
     }
 
-    // Heartbeat: keeps the console alive and reports link/heap.
+    // Heartbeat: report link/heap, and auto-recover STT from a fatal Soniox error.
     char ip[16];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(10000));
         const char *stt_err = soniox_last_error();
-        if (net_get_ip_str(ip, sizeof(ip))) {
+        bool online = net_get_ip_str(ip, sizeof(ip));
+        if (online) {
             ESP_LOGI(TAG, "heartbeat: online ip=%s  stt=%d  free_heap=%u  psram=%u",
                      ip, soniox_session_active(), (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
@@ -156,6 +157,18 @@ void app_main(void)
             ESP_LOGW(TAG, "heartbeat: offline  free_heap=%u",
                      (unsigned)esp_get_free_heap_size());
         }
-        if (stt_err) ESP_LOGE(TAG, "STT disabled — Soniox error: %s (re-check the key)", stt_err);
+        // A fatal Soniox error (e.g. "Request timeout" on a transient drop) leaves the session
+        // dead; tear it down and start a fresh one so STT self-heals without a reboot. Only when
+        // online (it needs the network); a clean turn never sets an error, so this won't fight the
+        // agent task's stop/start. A persistently bad key just retries each heartbeat (~10 s).
+        if (stt_err && online) {
+            ESP_LOGW(TAG, "STT down (Soniox: %s) — restarting session", stt_err);
+            soniox_session_stop();
+            soniox_cfg_t scfg = { 0 };   // api_key re-read from NVS
+            if (soniox_session_start(&scfg, on_partial, on_turn, NULL) == ESP_OK)
+                ESP_LOGI(TAG, "STT session restarted");
+            else
+                ESP_LOGW(TAG, "STT restart failed — retrying next heartbeat");
+        }
     }
 }

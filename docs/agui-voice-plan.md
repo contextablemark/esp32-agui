@@ -245,6 +245,24 @@ Advertised in `RunAgentInput.tools`; on `TOOL_CALL_*` the device executes locall
   `TEXT_MESSAGE_CONTENT` — the reply text lives inside the A2UI spec. Rendering A2UI trees in LVGL is
   a substantial UI layer. **Parked past v1**; P3–P8 target a `TEXT_*`-emitting agent. The agui_client
   event router is left as-is (it already surfaces the tool call). Revisit if on-device A2UI proves worth it.
+- **Wake-word / PTT turn control (post-P8).** Open the Soniox session only for an *active turn*
+  instead of streaming continuously. This is also the **correct** fix for streaming idle silence —
+  NOT on-device chunk VAD, which is incompatible with Soniox (it does its own server VAD/endpointing
+  and times out the session after ~20 s of no audio; tried & reverted 2026-06-22). Two flavors with
+  very different power:
+  - **PTT** (BOOT button / touch): device can light/deep-sleep between turns → **days** of standby;
+    mic+WiFi active only during an interaction. Cheapest to build, biggest battery win. Start here.
+  - **Always-listening wake-word** (ESP-SR WakeNet on core 1): CPU + mic + WiFi never sleep →
+    rough **~4–8 h on a small ~500 mAh cell** (scale by actual battery; display-off + WiFi DTIM
+    power-save pushes toward the high end). Needs a WakeNet **model partition** (partition-table
+    change + flash). Add only if hands-free justifies the battery hit; measure real draw via the
+    AXP2101 before committing.
+  - **Note:** wake-word *detection* is fully on-device (WakeNet, no network). WiFi only matters
+    *after* a wake (to reach Soniox); it can be dropped during idle-listen and reconnected on wake
+    (lower power, +reconnect latency) rather than held associated.
+- **Soniox recognition-accuracy tuning (post-P8).** Domain context/hints so proper nouns/terms
+  aren't mangled, and possibly a higher-accuracy Soniox model. These are Soniox-side levers, not
+  on-device — independent of the capture path.
 
 ## 11. Risks / open questions
 - **Heap headroom** for one TLS session + LVGL + audio buffers — measure peak; keep buffers in PSRAM. (Sequential TLS avoids two concurrent sessions.)
