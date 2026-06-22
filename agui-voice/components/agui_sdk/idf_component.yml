@@ -1,0 +1,9 @@
+version: "0.1.0"
+description: >-
+  Vendored AG-UI community C++ SDK (ag-ui-protocol/ag-ui sdks/community/c++, MIT),
+  pinned + patched for ESP-IDF. libcurl transport dropped (see esp_http_service in
+  the agui_client component); REASONING_*/interrupt extensions added. See PATCHES.md.
+
+dependencies:
+  idf: ">=5.5"
+  johboh/nlohmann-json: "^3.12.0"
