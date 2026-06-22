@@ -52,6 +52,15 @@ Upstream's `RunFinishedEvent` carried only a generic `result`. Added the protoco
 > Note: the on-device interrupt **UI** (render-by-`responseSchema`, resume run) is firmware-side
 > (P6) and not part of this component.
 
+### D. UUID generator: `thread_local` → shared static + mutex (ESP-IDF TLS/stack fix)
+`src/core/uuid.cpp` — upstream's `thread_local std::mt19937 generator` is a ~2.5 KB TLS object.
+On ESP-IDF, thread-local storage is reserved from **every task's stack** at task creation, so a
+2.5 KB TLS block overflows small system-task stacks (e.g. the ~1.5 KB idle task) and corrupts the
+scheduler **at startup → boot loop**. Replaced with one shared `static std::mt19937` guarded by a
+`static std::mutex` (UUID generation is infrequent). This is an embedded-only constraint — it
+compiles/passes the host tests either way, so **this class of bug is on-target-only**; watch for any
+re-introduced `thread_local` on resync (`grep -rn thread_local src`).
+
 ## Not changed
 Unknown event types are intentionally left to upstream's behavior: `parseSseEventData()` already
 catches the `parseEventType()` throw and **skips** unknown types with a warning (forward-compatible),
