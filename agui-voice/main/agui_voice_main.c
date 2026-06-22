@@ -237,7 +237,9 @@ void app_main(void)
 
     // P3: BOOT-button push-to-talk.
     s_ptt_q = xQueueCreate(4, sizeof(int));
-    xTaskCreate(ptt_task, "ptt", 12288, NULL, 5, NULL);     // agui_run TLS handshake runs on this stack
+    // agui_run runs on this stack: TLS handshake + the C++ SDK (nlohmann JSON serialize/parse is
+    // recursive + C++ exception unwinding), so it needs more headroom than the old cJSON path.
+    xTaskCreate(ptt_task, "ptt", 16384, NULL, 5, NULL);
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
     ESP_LOGI(TAG, "ready — hold BOOT (GPIO0) to talk");
