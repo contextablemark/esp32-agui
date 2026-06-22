@@ -98,12 +98,13 @@ static bool form_field(const char *body, const char *name, char *out, size_t out
 static esp_err_t root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");   // always serve the current form (no stale cache)
     return httpd_resp_send(req, FORM, HTTPD_RESP_USE_STRLEN);
 }
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    char body[1280];   // holds all urlencoded fields (ssid/pass/soniox/agui_url/agui_token)
+    static char body[1280];   // urlencoded fields; static (httpd is single-threaded) keeps it off the stack
     int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int got = 0;
     while (got < total) {
@@ -119,6 +120,8 @@ static esp_err_t save_post(httpd_req_t *req)
     bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
     bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
     bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
+    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d  (agui_url field in body=%d)",
+             got, have_ssid, have_soniox, have_url, have_token, strstr(body, "agui_url=") != NULL);
     if (!have_ssid && !have_soniox && !have_url && !have_token) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
@@ -132,10 +135,23 @@ static esp_err_t save_post(httpd_req_t *req)
     if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
 
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req,
-        "<html><body style='font-family:sans-serif;margin:2em'>"
-        "<h3>Saved.</h3><p>The device is applying settings now. You can close this page.</p>"
-        "</body></html>");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    static char resp[768];
+    snprintf(resp, sizeof resp,
+        "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;margin:2em'><h3>Saved</h3>"
+        "<p>This is exactly what the device received:</p><ul>"
+        "<li>WiFi: <b>%s</b></li>"
+        "<li>Soniox key: <b>%s</b></li>"
+        "<li>AG-UI URL: <b>%s</b></li>"
+        "<li>AG-UI token: <b>%s</b></li>"
+        "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
+        "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
+        have_ssid ? "updated" : "unchanged",
+        have_soniox ? "updated" : "unchanged",
+        have_url ? agui_url : "unchanged",
+        have_token ? "updated" : "unchanged");
+    httpd_resp_sendstr(req, resp);
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
     return ESP_OK;
 }
@@ -207,6 +223,7 @@ esp_err_t net_portal_start(const char *ap_ssid)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.uri_match_fn = httpd_uri_match_wildcard;
     cfg.lru_purge_enable = true;
+    cfg.stack_size = 8192;   // save_post handles ~2 KB of buffers; the 4 KB default overflows
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) return ESP_FAIL;
     httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
     httpd_uri_t u_save = { .uri = "/save", .method = HTTP_POST, .handler = save_post };

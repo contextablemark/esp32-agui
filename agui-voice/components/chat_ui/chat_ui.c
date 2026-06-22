@@ -116,14 +116,21 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
     lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
 
-    s_status = lv_label_create(scr);
-    lv_label_set_long_mode(s_status, LV_LABEL_LONG_DOT);
-    lv_obj_set_width(s_status, BSP_LCD_H_RES - 2 * SAFE_INSET);
-    lv_obj_set_style_text_align(s_status, LV_TEXT_ALIGN_CENTER, 0);
+    // Status line: a fixed-width clipping box holding a single-line label. Long live transcripts
+    // scroll left so the tail (latest words) stays on screen; short messages center. (clips to the
+    // box edges, respecting the round-corner safe zone — not the screen edge.)
+    lv_obj_t *box = lv_obj_create(scr);
+    lv_obj_remove_style_all(box);
+    lv_obj_set_size(box, CHAT_W, STATUS_H);
+    lv_obj_align(box, LV_ALIGN_TOP_MID, 0, SAFE_INSET);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+
+    s_status = lv_label_create(box);
+    lv_label_set_long_mode(s_status, LV_LABEL_LONG_CLIP);   // one line, full content width, no dots
     lv_obj_set_style_text_color(s_status, lv_palette_main(LV_PALETTE_GREY), 0);
     lv_obj_set_style_text_font(s_status, &lv_font_montserrat_16, 0);
+    lv_obj_set_pos(s_status, 0, 7);
     lv_label_set_text(s_status, "Ready");
-    lv_obj_align(s_status, LV_ALIGN_TOP_MID, 0, SAFE_INSET);
 
     s_chat = lv_obj_create(scr);
     lv_obj_remove_style_all(s_chat);
@@ -177,9 +184,13 @@ void chat_ui_append_assistant(const char *delta)
 void chat_ui_status(const char *text)
 {
     if (!s_status || !bsp_display_lock(1000)) return;
-    char clean[256];
+    char clean[1024];                              // live transcript can be long
     sanitize(text ? text : "", clean, sizeof clean);
     lv_label_set_text(s_status, clean);
+    lv_obj_update_layout(s_status);                // measure full text width, then position:
+    lv_coord_t lw = lv_obj_get_width(s_status), bw = CHAT_W;
+    lv_obj_set_x(s_status, lw > bw ? (bw - lw)      // overflow → show the tail (scroll left)
+                                   : (bw - lw) / 2); // fits → center
     bsp_display_unlock();
 }
 

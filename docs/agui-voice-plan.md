@@ -250,8 +250,13 @@ Advertised in `RunAgentInput.tools`; on `TOOL_CALL_*` the device executes locall
   NOT on-device chunk VAD, which is incompatible with Soniox (it does its own server VAD/endpointing
   and times out the session after ~20 s of no audio; tried & reverted 2026-06-22). Two flavors with
   very different power:
-  - **PTT** (BOOT button / touch): device can light/deep-sleep between turns → **days** of standby;
-    mic+WiFi active only during an interaction. Cheapest to build, biggest battery win. Start here.
+  - **PTT — CHOSEN (2026-06-22).** Repurpose the **BOOT button (GPIO0)** as a hold-to-talk key:
+    press → open Soniox + stream; release → `soniox_finalize` → transcribe → run the agent. GPIO0 is
+    only a strapping pin at *reset* (don't hold during power-on); at runtime it's a normal input.
+    The session is open ONLY while held → no continuous streaming → structurally avoids the Soniox
+    idle-timeout + idle-garbage (no VAD needed), and behaves identically plugged or on battery.
+    Use case: **desktop-primary, battery-portable secondary** — PTT fits both. Device can sleep
+    between turns → days of standby on battery.
   - **Always-listening wake-word** (ESP-SR WakeNet on core 1): CPU + mic + WiFi never sleep →
     rough **~4–8 h on a small ~500 mAh cell** (scale by actual battery; display-off + WiFi DTIM
     power-save pushes toward the high end). Needs a WakeNet **model partition** (partition-table

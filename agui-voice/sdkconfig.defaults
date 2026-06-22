@@ -11,14 +11,14 @@ CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
 # TLS root certs for WSS (Soniox) / HTTPS — full bundle covers their CA chain.
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
 CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
-# Force dual-cert servers (notably ngrok) onto their RSA certificate. The device's TLS 1.2
-# ECDSA-cert handshake fails against ngrok's edge (mbedTLS CONN_EOF / -0x7280 immediately after
-# "Certificate validated"), while the RSA path is proven good (Soniox, Railway, and ngrok from a
-# desktop client). Disabling the two ECDSA key-exchange methods makes the client offer only
-# RSA-cert ciphersuites, so ngrok serves its RSA cert. ECDSA *certificate verification* is
-# unaffected (still enabled via MBEDTLS_ECDSA_C). Revisit if a target ever needs an ECDSA-only TLS server.
-CONFIG_MBEDTLS_KEY_EXCHANGE_ECDHE_ECDSA=n
-CONFIG_MBEDTLS_KEY_EXCHANGE_ECDH_ECDSA=n
+# Enable the TLS 1.3 client. The device was TLS-1.2-only, which caused edge-specific handshake
+# failures: ngrok's ECDSA 1.2 path returned CONN_EOF (-0x7280), and the earlier workaround (force
+# RSA-only ciphers) then broke Railway — no common 1.2 cipher → fatal alert (-0x7780). Modern edges
+# (ngrok, Railway, Soniox) all negotiate TLS 1.3 natively, so enabling it lets the device speak the
+# protocol both sides prefer, with the full cipher set kept (ECDSA re-enabled), and connect to all
+# of them with no per-agent cipher juggling.
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
+CONFIG_MBEDTLS_SSL_TLS1_3_KEXM_EPHEMERAL=y
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
