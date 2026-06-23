@@ -204,9 +204,11 @@ static void ptt_task(void *arg)
     }
 }
 
-static void ptt_down_cb(void *btn, void *ctx) { int e = 1; xQueueSend(s_ptt_q, &e, 0); }  // hold → talk
-static void ptt_up_cb(void *btn, void *ctx)   { int e = 0; xQueueSend(s_ptt_q, &e, 0); }  // release
-static void ptt_dbl_cb(void *btn, void *ctx)  { int e = 2; xQueueSend(s_ptt_q, &e, 0); }  // double-tap → setup
+// Any BOOT-button interaction wakes the display (note_activity un-arms a PWR-forced-off screen too),
+// so reaching for the button to talk lights the screen even if it had blanked.
+static void ptt_down_cb(void *btn, void *ctx) { chat_ui_note_activity(); int e = 1; xQueueSend(s_ptt_q, &e, 0); }  // hold → talk
+static void ptt_up_cb(void *btn, void *ctx)   { chat_ui_note_activity(); int e = 0; xQueueSend(s_ptt_q, &e, 0); }  // release
+static void ptt_dbl_cb(void *btn, void *ctx)  { chat_ui_note_activity(); int e = 2; xQueueSend(s_ptt_q, &e, 0); }  // double-tap → setup
 
 static esp_err_t ptt_button_init(void)
 {
