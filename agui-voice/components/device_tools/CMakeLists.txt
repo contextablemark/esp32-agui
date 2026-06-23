@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS "device_tools.c"
     INCLUDE_DIRS "include"
-    REQUIRES json)
-# P5/P7 add: board_variant + esp32_s3_touch_amoled_1_8 (QMI8658 motion / AXP2101 battery
-# / PCF85063 time + RTC alarm) for ambient context and the set_timer/set_alarm/show_qr tools.
+    REQUIRES json esp_driver_i2c esp32_s3_touch_amoled_1_8)
+# esp_driver_i2c + the BSP (bsp_i2c_get_handle) for AXP2101 battery reads on the shared I2C bus.
+# P5/P7 add later: QMI8658 motion (device_motion) and PCF85063 RTC alarm (set_alarm tool).

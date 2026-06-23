@@ -1,8 +1,12 @@
 #include "device_tools.h"
 
+#include <stdio.h>
+#include <stdbool.h>
 #include <time.h>
 
 #include "esp_log.h"
+#include "driver/i2c_master.h"
+#include "bsp/esp32_s3_touch_amoled_1_8.h"
 
 static const char *TAG = "device_tools";
 
@@ -39,7 +43,56 @@ static void add_local_time(cJSON *arr)
     localtime_r(&now, &lt);
     char iso[40];
     strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%S%z", &lt);
-    ctx_add(arr, "local_time", iso);
+    ctx_add(arr, "current_local_time", iso);   // clearer key so the agent prefers it over searching
+}
+
+// --- battery (AXP2101 PMIC @ 0x34 on the shared BSP I2C bus) ---------------------------------
+// Register-level reads mirroring XPowersLib (so no Arduino-C++ lib is vendored). We only do
+// MEASUREMENT-enable writes (battery ADC on, TS-pin off) — exactly the read path the proven
+// 01_AXP2101 example uses — and never touch power rails or charger settings.
+#define AXP2101_ADDR        0x34
+#define AXP_REG_STATUS1     0x00   // bit3 = battery connected
+#define AXP_REG_STATUS2     0x01   // (val >> 5) == 1 => charging
+#define AXP_REG_ADC_CTRL    0x30   // bit0 = batt-voltage ADC enable; bit1 = TS-pin measure
+#define AXP_REG_BAT_PERCENT 0xA4   // 0..100
+
+static i2c_master_dev_handle_t s_axp;   // lazily added to the BSP bus
+
+static esp_err_t axp_rd(uint8_t reg, uint8_t *val)
+{ return i2c_master_transmit_receive(s_axp, &reg, 1, val, 1, 100); }
+static esp_err_t axp_wr(uint8_t reg, uint8_t val)
+{ uint8_t b[2] = { reg, val }; return i2c_master_transmit(s_axp, b, 2, 100); }
+
+// Bring the AXP2101 up on the shared BSP I2C bus + enable battery measurement. Lazy & idempotent
+// (bsp_i2c_init() is a no-op if already initialized), so call order vs the display doesn't matter.
+static bool axp_ensure(void)
+{
+    if (s_axp) return true;
+    if (bsp_i2c_init() != ESP_OK) return false;
+    i2c_master_bus_handle_t bus = bsp_i2c_get_handle();
+    if (!bus) return false;
+    i2c_device_config_t cfg = { .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+                                .device_address = AXP2101_ADDR, .scl_speed_hz = 400000 };
+    if (i2c_master_bus_add_device(bus, &cfg, &s_axp) != ESP_OK) { s_axp = NULL; return false; }
+    uint8_t adc;   // measurement-only: enable batt ADC (needed for the % gauge), disable TS pin
+    if (axp_rd(AXP_REG_ADC_CTRL, &adc) == ESP_OK) {
+        adc = (uint8_t)((adc | (1u << 0)) & ~(1u << 1));
+        axp_wr(AXP_REG_ADC_CTRL, adc);
+    }
+    return true;
+}
+
+// battery → {"pct":<0-100>,"charging":<bool>} (JSON-stringified). Skipped if no battery is present.
+static void add_battery(cJSON *arr)
+{
+    if (!axp_ensure()) return;
+    uint8_t s1, s2, pct;
+    if (axp_rd(AXP_REG_STATUS1, &s1) != ESP_OK || !(s1 & (1u << 3))) return;   // no battery connected
+    if (axp_rd(AXP_REG_BAT_PERCENT, &pct) != ESP_OK || pct > 100) return;      // invalid gauge read
+    bool charging = (axp_rd(AXP_REG_STATUS2, &s2) == ESP_OK) && ((s2 >> 5) == 0x01);
+    char val[48];
+    snprintf(val, sizeof val, "{\"pct\":%u,\"charging\":%s}", pct, charging ? "true" : "false");
+    ctx_add(arr, "battery", val);
 }
 
 cJSON *device_context_build(void)
@@ -48,7 +101,8 @@ cJSON *device_context_build(void)
     if (!arr) return NULL;
 
     add_local_time(arr);
-    // Next P5 increments append here: battery (AXP2101 pct+charging), device_motion (QMI8658).
+    add_battery(arr);
+    // Next P5 increment appends here: device_motion (QMI8658).
 
     if (cJSON_GetArraySize(arr) == 0) {   // nothing to report yet → send no context
         cJSON_Delete(arr);
