@@ -12,8 +12,9 @@ static const char *TAG = "device_tools";
 
 // Ambient context (P5): read-only device signals pushed to the agent each run via
 // RunAgentInput.context. The AG-UI Context.value is a STRING, so structured signals are
-// JSON-stringified into the value (see ctx_add). v1 ships local_time; battery (AXP2101) and
-// device_motion (QMI8658) are the next increments. set_timer/set_alarm/show_qr tools are P7.
+// JSON-stringified into the value (see ctx_add). v1 ships current_local_time + battery (AXP2101);
+// device_motion (QMI8658) is deferred (low value for a desktop device). set_timer/set_alarm/show_qr
+// tools are P7.
 
 esp_err_t device_tools_init(void)
 {
@@ -52,8 +53,10 @@ static void add_local_time(cJSON *arr)
 // so we can poll them) — exactly the read path the proven 01_AXP2101 example uses — and never
 // touch power rails or charger settings.
 #define AXP2101_ADDR        0x34
-#define AXP_REG_STATUS1     0x00   // bit3 = battery connected
-#define AXP_REG_STATUS2     0x01   // (val >> 5) == 1 => charging
+#define AXP_REG_STATUS1     0x00   // bit5 = VBUS good (USB power present); bit3 = battery connected
+#define AXP_ST1_VBUS_GOOD   (1u << 5) // USB/VBUS present & valid → device is "plugged in"
+#define AXP_ST1_BAT_PRESENT (1u << 3) // battery connected
+#define AXP_REG_STATUS2     0x01   // (val >> 5): 0=standby/full, 1=charging, 2=discharging
 #define AXP_REG_ADC_CTRL    0x30   // bit0 = batt-voltage ADC enable; bit1 = TS-pin measure
 #define AXP_REG_IRQ_EN2     0x41   // INTEN2: enable PWRKEY short=bit3 / long=bit2 IRQ latching
 #define AXP_REG_IRQ_STS2    0x49   // INTSTS2: PWRKEY short=bit3 / long=bit2 status (write-1-to-clear)
@@ -90,16 +93,24 @@ static bool axp_ensure(void)
     return true;
 }
 
-// battery → {"pct":<0-100>,"charging":<bool>} (JSON-stringified). Skipped if no battery is present.
+// battery → {"percent":0-100,"plugged_in":<bool>,"status":"<words>"} (JSON-stringified). Skipped if
+// no battery is present. `status` is an explicit, human-readable charge state so the model never has
+// to infer plugged-vs-unplugged from a bare "charging:false" — which is true BOTH when running on
+// battery AND when plugged in but full. That ambiguity was confusing the agent.
 static void add_battery(cJSON *arr)
 {
     if (!axp_ensure()) return;
     uint8_t s1, s2, pct;
-    if (axp_rd(AXP_REG_STATUS1, &s1) != ESP_OK || !(s1 & (1u << 3))) return;   // no battery connected
-    if (axp_rd(AXP_REG_BAT_PERCENT, &pct) != ESP_OK || pct > 100) return;      // invalid gauge read
+    if (axp_rd(AXP_REG_STATUS1, &s1) != ESP_OK || !(s1 & AXP_ST1_BAT_PRESENT)) return;  // no battery
+    if (axp_rd(AXP_REG_BAT_PERCENT, &pct) != ESP_OK || pct > 100) return;               // invalid gauge read
+    bool plugged  = (s1 & AXP_ST1_VBUS_GOOD) != 0;                                       // USB power present
     bool charging = (axp_rd(AXP_REG_STATUS2, &s2) == ESP_OK) && ((s2 >> 5) == 0x01);
-    char val[48];
-    snprintf(val, sizeof val, "{\"pct\":%u,\"charging\":%s}", pct, charging ? "true" : "false");
+    const char *status = !plugged ? "on battery"                  // unplugged → discharging
+                       : charging ? "charging"                    // plugged in, taking charge
+                                  : "plugged in, not charging";   // plugged in but full / charge complete
+    char val[80];
+    snprintf(val, sizeof val, "{\"percent\":%u,\"plugged_in\":%s,\"status\":\"%s\"}",
+             pct, plugged ? "true" : "false", status);
     ctx_add(arr, "battery", val);
 }
 
