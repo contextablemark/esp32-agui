@@ -260,6 +260,7 @@ void app_main(void)
     xTaskCreate(ptt_task, "ptt", 16384, NULL, 5, NULL);
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
+    chat_ui_screen_power_start(60);    // P7: blank the AMOLED after 60s idle; wake on touch / PWR key / activity
     ESP_LOGI(TAG, "ready — hold BOOT (GPIO0) to talk");
 
     // Heartbeat: link + heap (internal RAM is the scarce one with the display).

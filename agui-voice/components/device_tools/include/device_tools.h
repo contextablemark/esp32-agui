@@ -5,6 +5,8 @@
 // See docs/agui-voice-plan.md §5.3 / §6.
 #pragma once
 
+#include <stdbool.h>
+
 #include "esp_err.h"
 #include "cJSON.h"
 
@@ -17,6 +19,11 @@ esp_err_t device_tools_init(void);
 
 cJSON *device_context_build(void);   // [{description,value}] ambient context
 cJSON *device_tools_manifest(void);  // JSON-schema list for RunAgentInput.tools
+
+// PWR button (AXP2101 PWRKEY) short-press since the last call (latched IRQ, write-1-to-clear).
+// A long press is a hardware power-off handled by the PMIC, so only short presses are reported.
+// Used by the chat_ui screen-power saver to wake the display. False if the AXP2101 is unavailable.
+bool device_power_key_short_press(void);
 
 // A tool implementation: parse args, produce a result JSON (caller owns *result).
 typedef esp_err_t (*device_tool_fn)(const cJSON *args, cJSON **result);

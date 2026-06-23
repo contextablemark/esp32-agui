@@ -46,15 +46,20 @@ static void add_local_time(cJSON *arr)
     ctx_add(arr, "current_local_time", iso);   // clearer key so the agent prefers it over searching
 }
 
-// --- battery (AXP2101 PMIC @ 0x34 on the shared BSP I2C bus) ---------------------------------
+// --- AXP2101 PMIC @ 0x34 on the shared BSP I2C bus (battery + PWR key) ------------------------
 // Register-level reads mirroring XPowersLib (so no Arduino-C++ lib is vendored). We only do
-// MEASUREMENT-enable writes (battery ADC on, TS-pin off) — exactly the read path the proven
-// 01_AXP2101 example uses — and never touch power rails or charger settings.
+// MEASUREMENT-enable + PWRKEY-IRQ-enable writes (battery ADC on, TS-pin off; latch PWRKEY presses
+// so we can poll them) — exactly the read path the proven 01_AXP2101 example uses — and never
+// touch power rails or charger settings.
 #define AXP2101_ADDR        0x34
 #define AXP_REG_STATUS1     0x00   // bit3 = battery connected
 #define AXP_REG_STATUS2     0x01   // (val >> 5) == 1 => charging
 #define AXP_REG_ADC_CTRL    0x30   // bit0 = batt-voltage ADC enable; bit1 = TS-pin measure
+#define AXP_REG_IRQ_EN2     0x41   // INTEN2: enable PWRKEY short=bit3 / long=bit2 IRQ latching
+#define AXP_REG_IRQ_STS2    0x49   // INTSTS2: PWRKEY short=bit3 / long=bit2 status (write-1-to-clear)
 #define AXP_REG_BAT_PERCENT 0xA4   // 0..100
+#define AXP_IRQ_PKEY_SHORT  (1u << 3)
+#define AXP_IRQ_PKEY_LONG   (1u << 2)
 
 static i2c_master_dev_handle_t s_axp;   // lazily added to the BSP bus
 
@@ -79,6 +84,9 @@ static bool axp_ensure(void)
         adc = (uint8_t)((adc | (1u << 0)) & ~(1u << 1));
         axp_wr(AXP_REG_ADC_CTRL, adc);
     }
+    uint8_t irqen; // latch PWRKEY short/long-press IRQs so device_power_key_short_press() can poll them
+    if (axp_rd(AXP_REG_IRQ_EN2, &irqen) == ESP_OK)
+        axp_wr(AXP_REG_IRQ_EN2, (uint8_t)(irqen | AXP_IRQ_PKEY_SHORT | AXP_IRQ_PKEY_LONG));
     return true;
 }
 
@@ -93,6 +101,20 @@ static void add_battery(cJSON *arr)
     char val[48];
     snprintf(val, sizeof val, "{\"pct\":%u,\"charging\":%s}", pct, charging ? "true" : "false");
     ctx_add(arr, "battery", val);
+}
+
+// PWR button (AXP2101 PWRKEY) short-press since the last call. The PMIC latches short/long-press
+// events in INTSTS2 (we poll it — the AXP IRQ pin isn't wired to a GPIO on this board). A long press
+// is a hardware power-off the PMIC does on its own, so only short presses are reported (used by the
+// chat_ui screen-power saver to wake the display). Both bits are cleared (write-1-to-clear).
+bool device_power_key_short_press(void)
+{
+    if (!axp_ensure()) return false;
+    uint8_t sts;
+    if (axp_rd(AXP_REG_IRQ_STS2, &sts) != ESP_OK) return false;
+    uint8_t hit = sts & (AXP_IRQ_PKEY_SHORT | AXP_IRQ_PKEY_LONG);
+    if (hit) axp_wr(AXP_REG_IRQ_STS2, hit);          // clear only the PWRKEY bits we consumed
+    return (sts & AXP_IRQ_PKEY_SHORT) != 0;
 }
 
 cJSON *device_context_build(void)

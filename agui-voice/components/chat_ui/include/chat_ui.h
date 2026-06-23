@@ -27,6 +27,15 @@ void  chat_ui_clear_status(void);
 void  chat_ui_show_qr(const char *data);   // lv_qrcode
 void  chat_ui_idle_timer(int seconds_left, const char *label);
 
+// Screen-power saver (P7): blank the AMOLED (brightness 0) after `idle_timeout_s` of no touch /
+// PTT / UI activity, and wake it on any of those. The PWR button (AXP2101 PWRKEY) short-press
+// TOGGLES the screen: on→off immediately (skip the timeout), off→on. Pass <=0 for the default
+// (60s). Starts a small background task; call once after chat_ui_init() and the device is ready.
+void  chat_ui_screen_power_start(int idle_timeout_s);
+// Mark user/agent activity so the screen-power saver keeps the display awake. The UI mutators call
+// this internally; call it too from external input sources (e.g. button presses).
+void  chat_ui_note_activity(void);
+
 // Interrupt prompt: build widgets from response_schema; answer returned via callback.
 typedef void (*chat_ui_answer_cb)(const cJSON *answer, void *ctx);
 void  chat_ui_prompt(const char *message, const cJSON *response_schema,

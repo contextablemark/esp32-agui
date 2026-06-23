@@ -6,8 +6,12 @@
 
 #include "chat_ui.h"
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
+#include "device_tools.h"
 #include "lvgl.h"
 
 static const char *TAG = "chat_ui";
@@ -22,6 +26,10 @@ static const char *TAG = "chat_ui";
 #define COL_ASSIST    0x2C2C2E   // dark grey
 #define MAX_BUBBLES   30         // prune oldest rows beyond this
 #define CHAT_FONT     (&lv_font_montserrat_20)   // bubbles + status line (one place to retune)
+
+#define SCREEN_ON_BRIGHTNESS   90       // % brightness when awake
+#define SCREEN_IDLE_TIMEOUT_MS 60000    // default: blank the AMOLED after this much inactivity
+#define SCREEN_POLL_MS         200      // screen-power tick = wake latency + PWR-key poll cadence
 
 static lv_obj_t *s_chat;         // scrollable flex column of message rows
 static lv_obj_t *s_status;       // top status label
@@ -145,13 +153,14 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_scrollbar_mode(s_chat, LV_SCROLLBAR_MODE_OFF);
 
     bsp_display_unlock();
-    bsp_display_brightness_set(90);
+    bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
     ESP_LOGI(TAG, "chat UI up (%dx%d, LVGL 8.4)", BSP_LCD_H_RES, BSP_LCD_V_RES);
     return ESP_OK;
 }
 
 void chat_ui_add_user(const char *text)
 {
+    chat_ui_note_activity();
     if (!s_chat || !bsp_display_lock(1000)) return;
     add_bubble(true, COL_USER, text);
     scroll_bottom();
@@ -160,6 +169,7 @@ void chat_ui_add_user(const char *text)
 
 void *chat_ui_begin_assistant(void)
 {
+    chat_ui_note_activity();
     if (!s_chat || !bsp_display_lock(1000)) return NULL;
     s_assist_buf[0] = '\0'; s_assist_len = 0;
     s_assist_lbl = add_bubble(false, COL_ASSIST, "");
@@ -170,6 +180,7 @@ void *chat_ui_begin_assistant(void)
 
 void chat_ui_append_assistant(const char *delta)
 {
+    chat_ui_note_activity();
     if (!s_assist_lbl || !delta || !bsp_display_lock(1000)) return;
     size_t dl = strlen(delta);
     if (s_assist_len + dl < sizeof(s_assist_buf)) {     // accumulate, then re-measure+wrap the whole text
@@ -184,6 +195,7 @@ void chat_ui_append_assistant(const char *delta)
 
 void chat_ui_status(const char *text)
 {
+    chat_ui_note_activity();
     if (!s_status || !bsp_display_lock(1000)) return;
     char clean[1024];                              // live transcript can be long
     sanitize(text ? text : "", clean, sizeof clean);
@@ -197,9 +209,71 @@ void chat_ui_status(const char *text)
 
 void chat_ui_clear_status(void) { chat_ui_status("Ready"); }
 
+// --- screen-power saver (P7) -----------------------------------------------------------------
+// Blank the AMOLED (brightness 0 ≈ near-zero panel draw on OLED) after a span with no activity,
+// and wake on any input. Activity = touch (LVGL tracks it per input device), the PWR key (AXP2101
+// PWRKEY, polled via device_tools), or any UI mutation (the chat_ui_* setters call note_activity,
+// which covers PTT turns + streaming replies). A separate low-priority task polls so the I2C PWR-key
+// read never runs under the LVGL lock. This is distinct from chat_ui_idle_timer (the set_timer
+// countdown shown on the idle screen), below.
+static volatile uint32_t s_last_activity_ms;            // monotonic ms of last non-touch activity
+static uint32_t          s_idle_timeout_ms = SCREEN_IDLE_TIMEOUT_MS;
+static bool              s_screen_on = true;
+static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
+static uint32_t          s_force_off_ms;                // when the force-off press happened
+
+static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
+
+static void screen_power_task(void *arg)
+{
+    chat_ui_note_activity();
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(SCREEN_POLL_MS));
+
+        // PWR (AXP2101 PWRKEY) short press TOGGLES the screen: when off it wakes; when on it forces
+        // off immediately, without waiting out the idle timeout. A forced-off screen stays off until
+        // activity *newer* than the press arrives (touch / PWR tap / UI) — so the press itself, and
+        // any touch just before it, don't re-wake it.
+        if (device_power_key_short_press()) {
+            if (s_screen_on) { s_force_off_armed = true; s_force_off_ms = now_ms(); }
+            else             { s_force_off_armed = false; chat_ui_note_activity(); }
+        }
+
+        uint32_t touch_idle = UINT32_MAX;                             // ms since last touch (LVGL-tracked)
+        if (bsp_display_lock(50)) { touch_idle = lv_disp_get_inactive_time(NULL); bsp_display_unlock(); }
+        uint32_t now = now_ms();
+        uint32_t act_age = now - s_last_activity_ms;                  // ms since last UI/PTT/PWR-wake
+        uint32_t idle = touch_idle < act_age ? touch_idle : act_age; // youngest activity of any kind
+
+        if (s_force_off_armed && idle < (now - s_force_off_ms))
+            s_force_off_armed = false;                               // activity after the press → unarm
+
+        bool want_on = s_force_off_armed ? false : (idle < s_idle_timeout_ms);
+        if (want_on != s_screen_on) {
+            s_screen_on = want_on;
+            bsp_display_brightness_set(want_on ? SCREEN_ON_BRIGHTNESS : 0);
+            ESP_LOGI(TAG, "screen %s (idle=%ums%s)", want_on ? "on" : "off",
+                     (unsigned)idle, want_on ? "" : (s_force_off_armed ? ", PWR-off" : ""));
+        }
+    }
+}
+
+void chat_ui_screen_power_start(int idle_timeout_s)
+{
+    if (idle_timeout_s > 0) s_idle_timeout_ms = (uint32_t)idle_timeout_s * 1000;
+    chat_ui_note_activity();
+    s_screen_on = true;
+    s_force_off_armed = false;
+    xTaskCreate(screen_power_task, "scrnpwr", 4096, NULL, 3, NULL);
+    ESP_LOGI(TAG, "screen-power saver: blank after %us idle (wake on touch / PWR key / activity)",
+             (unsigned)(s_idle_timeout_ms / 1000));
+}
+
 // --- later phases ---
 void chat_ui_show_qr(const char *data)            { (void)data; }          // P6
-void chat_ui_idle_timer(int s, const char *label) { (void)s; (void)label; } // P7
+void chat_ui_idle_timer(int s, const char *label) { (void)s; (void)label; } // P7: set_timer countdown
 
 void chat_ui_prompt(const char *message, const cJSON *response_schema,
                     int64_t expires_at, chat_ui_answer_cb cb, void *ctx)
