@@ -21,7 +21,7 @@ static const char *TAG = "chat_ui";
 #define COL_USER      0x2563EB   // blue
 #define COL_ASSIST    0x2C2C2E   // dark grey
 #define MAX_BUBBLES   30         // prune oldest rows beyond this
-#define CHAT_FONT     (&lv_font_montserrat_18)   // bubbles + status line (one place to retune)
+#define CHAT_FONT     (&lv_font_montserrat_20)   // bubbles + status line (one place to retune)
 
 static lv_obj_t *s_chat;         // scrollable flex column of message rows
 static lv_obj_t *s_status;       // top status label
