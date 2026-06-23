@@ -249,9 +249,12 @@ void app_main(void)
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(15000));
         if (net_get_ip_str(ip, sizeof ip))
-            ESP_LOGI(TAG, "heartbeat: online ip=%s listening=%d free=%u internal=%u psram=%u",
+            // internal_max = largest contiguous internal block — TLS/lwIP send buffers need
+            // contiguous internal RAM, so this matters more than total free when sessions fail.
+            ESP_LOGI(TAG, "heartbeat: online ip=%s listening=%d free=%u internal=%u internal_max=%u psram=%u",
                      ip, s_listening, (unsigned)esp_get_free_heap_size(),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                     (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         else
             ESP_LOGW(TAG, "heartbeat: offline");
