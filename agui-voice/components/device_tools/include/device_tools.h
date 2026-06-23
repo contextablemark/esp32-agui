@@ -33,6 +33,14 @@ void device_tools_register(const char *name, const cJSON *schema, device_tool_fn
 // Dispatch a tool call by name (returns ESP_ERR_NOT_FOUND if unknown).
 esp_err_t device_tools_dispatch(const char *name, const cJSON *args, cJSON **result);
 
+// True if `name` is a registered client tool (device executes it + owes a result). False for
+// server/agent tools, which the device must NOT capture or answer.
+bool device_tools_is_client(const char *name);
+
+// set_timer accessors (the tool itself never touches the UI to avoid a chat_ui<->device_tools cycle):
+int  device_tools_timer_remaining(void);                  // seconds left on the active timer, 0 if none
+bool device_tools_timer_take_fired(char *label, size_t n); // true ONCE after a timer elapses (copies label)
+
 #ifdef __cplusplus
 }
 #endif

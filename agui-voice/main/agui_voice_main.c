@@ -87,6 +87,27 @@ static void on_turn(const char *text, void *ctx)             // Soniox endpoint 
 static bool s_assist_started;          // assistant bubble open for the current message?
 static bool s_run_error;               // run ended in error → keep the "Error" status visible
 
+// --- P7 client tools: pending list ------------------------------------------------------------
+// Client-tool calls the agent makes during a run are RECORDED here by h_tool_call (which runs INSIDE
+// agui_run under s_lock — so it may only copy strings, never dispatch/re-run). run_agent_turn drains
+// the list AFTER agui_run returns, executes each tool, returns a result, then re-runs. Owned solely
+// by ptt_task (single producer/consumer, never concurrent) → no locking.
+#define AGUI_TOOL_MAX_ITERS 5      // hard cap on run→tool→run cycles per utterance
+#define PEND_MAX            4      // max client tool calls captured per run
+#define TOOL_ID_MAX        64
+#define TOOL_NAME_MAX      48
+#define TOOL_ARGS_MAX     512
+
+typedef struct {
+    char id[TOOL_ID_MAX];
+    char name[TOOL_NAME_MAX];
+    char args[TOOL_ARGS_MAX];      // raw JSON string from the SDK ("{}" if empty)
+} pending_tool_t;
+
+static pending_tool_t s_pending[PEND_MAX];
+static int            s_pending_n;        // client tool calls recorded this run
+static bool           s_pending_overflow;
+
 static void h_run_started(void *c)
 {
     ESP_LOGI("agui", "thinking...");
@@ -119,6 +140,16 @@ static void h_tool_call(const char *id, const char *name, const char *args, void
     snprintf(s, sizeof s, "Using %s...", (name && *name) ? name : "tool");
     chat_ui_status(s);                       // transient chip; the next event overwrites it
     ESP_LOGI("agui", "TOOL_CALL %s (%s) args=%s", name, id, args);
+
+    // Record ONLY tools we can execute. Server/agent tools are run by the agent itself; we owe no
+    // result for them, so we must not capture (and later try to answer) them. Runs inside agui_run
+    // under s_lock → copy three strings and return; NO dispatch, NO re-run (would deadlock).
+    if (!device_tools_is_client(name)) return;
+    if (s_pending_n >= PEND_MAX) { s_pending_overflow = true; return; }
+    pending_tool_t *p = &s_pending[s_pending_n++];
+    strlcpy(p->id,   id   ? id   : "",                sizeof p->id);
+    strlcpy(p->name, name ? name : "",                sizeof p->name);
+    strlcpy(p->args, (args && args[0]) ? args : "{}", sizeof p->args);
 }
 static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); }
 static void h_error(const char *m, void *c)
@@ -156,9 +187,45 @@ static void run_agent_turn(const char *text)
     s_run_error      = false;
     chat_ui_status("Thinking...");
     agui_cfg_t acfg = { .endpoint = url, .auth_bearer = have_tok ? token : NULL, .thread_id = NULL };
-    cJSON *device_ctx = device_context_build();    // P5 ambient context (read-only; NULL if nothing yet)
-    agui_run(&acfg, text, device_ctx, NULL, NULL, &s_handlers, NULL);
-    cJSON_Delete(device_ctx);                      // agui_run copied what it needs; cJSON_Delete(NULL) is safe
+    cJSON *tools    = device_tools_manifest();     // advertised on EVERY run (NULL ⇒ no tools)
+
+    // The agent may call device client tools (set_timer, ...). Advertise them each run; after each
+    // run, drain any recorded calls — execute on-device, append a tool result to history, then re-run
+    // with NULL user_text so the agent continues. Bounded by AGUI_TOOL_MAX_ITERS. Every agui_run /
+    // agui_tool_result call happens HERE on ptt_task with s_lock free between them (no deadlock).
+    const char *user_text = text;                  // first run carries the utterance; continuations don't
+    for (int iter = 0; iter < AGUI_TOOL_MAX_ITERS; iter++) {
+        s_pending_n        = 0;                    // reset capture for THIS run
+        s_pending_overflow = false;
+
+        cJSON *device_ctx = device_context_build();          // fresh ambient context each run
+        agui_run(&acfg, user_text, device_ctx, tools, NULL, &s_handlers, NULL);  // BLOCKS; fills s_pending
+        cJSON_Delete(device_ctx);
+
+        if (s_run_error)   break;                  // transport/RUN_ERROR → stop (h_error kept "Error" up)
+        if (s_pending_n == 0) break;               // no client tool calls → turn complete
+        if (s_pending_overflow) ESP_LOGW(TAG, "tool calls truncated to %d this run", PEND_MAX);
+
+        // Execute each recorded client tool and round-trip a result into history.
+        for (int i = 0; i < s_pending_n; i++) {
+            pending_tool_t *p = &s_pending[i];
+            cJSON *args   = cJSON_Parse(p->args[0] ? p->args : "{}");
+            cJSON *result = NULL;
+            esp_err_t err = device_tools_dispatch(p->name, args, &result);
+            cJSON_Delete(args);
+            if (err != ESP_OK || !result) {        // synthesize an error result so the agent still gets
+                if (result) cJSON_Delete(result);  // a tool message (history stays paired) and can react
+                result = cJSON_CreateObject();
+                cJSON_AddBoolToObject(result, "ok", false);
+                cJSON_AddStringToObject(result, "error", esp_err_to_name(err));
+            }
+            agui_tool_result(p->id, result);       // appends one Tool-role msg to s_agent history
+            cJSON_Delete(result);
+        }
+        user_text = NULL;                          // continuation runs add NO user message
+    }
+
+    cJSON_Delete(tools);                           // cJSON_Delete(NULL) is safe
     if (!s_run_error) chat_ui_status(IDLE_HINT);   // success → idle prompt; on error keep "Error" up
 }
 
@@ -290,6 +357,22 @@ static esp_err_t ptt_button_init(void)
     return ESP_OK;
 }
 
+// Poll the device timer (~1s): when a set_timer elapses, surface it on-screen and chime. The tool
+// itself can't touch the UI (device_tools must not depend on chat_ui), so the alert lives here.
+static void timer_alert_task(void *arg)
+{
+    char label[40];
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        if (!device_tools_timer_take_fired(label, sizeof label)) continue;
+        chat_ui_note_activity();                       // wake the screen for the alert
+        char msg[64];
+        snprintf(msg, sizeof msg, "Timer done%s%s", label[0] ? ": " : "", label);
+        chat_ui_status(msg);
+        if (!s_listening) play_ptt_beep();             // chime, unless a PTT turn owns the speaker
+    }
+}
+
 void app_main(void)
 {
     ESP_LOGI(TAG, "AG-UI voice client booting (P0-P3)");
@@ -325,6 +408,7 @@ void app_main(void)
     // agui_run runs on this stack: TLS handshake + the C++ SDK (nlohmann JSON serialize/parse is
     // recursive + C++ exception unwinding), so it needs more headroom than the old cJSON path.
     xTaskCreate(ptt_task, "ptt", 16384, NULL, 5, NULL);
+    xTaskCreate(timer_alert_task, "tmralert", 4096, NULL, 3, NULL);   // P7: surface set_timer firings
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
     chat_ui_screen_power_start(60);    // power saver: blank the AMOLED after 60s idle; wake on touch / PWR key / activity

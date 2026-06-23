@@ -2,13 +2,17 @@
 
 #include <stdio.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
 
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "driver/i2c_master.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 
 static const char *TAG = "device_tools";
+
+static void register_builtins(void);   // defined with the tool registry (P7), below
 
 // Ambient context (P5): read-only device signals pushed to the agent each run via
 // RunAgentInput.context. The AG-UI Context.value is a STRING, so structured signals are
@@ -19,6 +23,7 @@ static const char *TAG = "device_tools";
 esp_err_t device_tools_init(void)
 {
     ESP_LOGI(TAG, "init");
+    register_builtins();   // P7: register builtin client tools (set_timer, ...)
     return ESP_OK;
 }
 
@@ -144,20 +149,151 @@ cJSON *device_context_build(void)
     return arr;
 }
 
-cJSON *device_tools_manifest(void)
-{
-    return NULL;  // P7: JSON-schema tool list
-}
+// --- client tool registry (P7) --------------------------------------------------------------
+// A tiny static registry of builtin client tools. Each entry holds the tool's AG-UI definition
+// ({description, parameters JSON-Schema}, used to build RunAgentInput.tools) and its handler.
+// Definitions persist for the process lifetime (built once at init).
+#define MAX_TOOLS 6
+
+typedef struct {
+    const char     *name;
+    cJSON          *def;    // {description, parameters}
+    device_tool_fn  fn;
+} tool_entry_t;
+
+static tool_entry_t s_tools[MAX_TOOLS];
+static int          s_tool_count;
 
 void device_tools_register(const char *name, const cJSON *schema, device_tool_fn fn)
 {
-    (void)schema; (void)fn;
-    ESP_LOGW(TAG, "device_tools_register(%s) not implemented yet", name ? name : "(null)");
+    if (!name || !fn || s_tool_count >= MAX_TOOLS) {
+        ESP_LOGW(TAG, "register(%s) dropped (registry full or invalid)", name ? name : "(null)");
+        return;
+    }
+    s_tools[s_tool_count++] = (tool_entry_t){ name, (cJSON *)schema, fn };
+    ESP_LOGI(TAG, "tool registered: %s", name);
 }
 
 esp_err_t device_tools_dispatch(const char *name, const cJSON *args, cJSON **result)
 {
-    (void)args; (void)result;
-    ESP_LOGW(TAG, "device_tools_dispatch(%s) not implemented yet", name ? name : "(null)");
-    return ESP_ERR_NOT_FOUND;
+    if (result) *result = NULL;
+    for (int i = 0; i < s_tool_count; i++)
+        if (name && strcmp(s_tools[i].name, name) == 0)
+            return s_tools[i].fn(args, result);
+    return ESP_ERR_NOT_FOUND;   // not one of our client tools — caller leaves it for the agent
+}
+
+// True if `name` is one of our registered client tools (so the device owes a TOOL result for it).
+// Server/agent tools return false — the caller must not capture or try to answer those.
+bool device_tools_is_client(const char *name)
+{
+    for (int i = 0; i < s_tool_count; i++)
+        if (name && strcmp(s_tools[i].name, name) == 0) return true;
+    return false;
+}
+
+// RunAgentInput.tools = [{name, description, parameters}] built from the registry (NULL if empty).
+cJSON *device_tools_manifest(void)
+{
+    if (s_tool_count == 0) return NULL;
+    cJSON *arr = cJSON_CreateArray();
+    if (!arr) return NULL;
+    for (int i = 0; i < s_tool_count; i++) {
+        cJSON *t = cJSON_CreateObject();
+        if (!t) continue;
+        cJSON_AddStringToObject(t, "name", s_tools[i].name);
+        const cJSON *desc   = cJSON_GetObjectItemCaseSensitive(s_tools[i].def, "description");
+        const cJSON *params = cJSON_GetObjectItemCaseSensitive(s_tools[i].def, "parameters");
+        if (cJSON_IsString(desc)) cJSON_AddStringToObject(t, "description", desc->valuestring);
+        if (params)               cJSON_AddItemToObject(t, "parameters", cJSON_Duplicate(params, true));
+        cJSON_AddItemToArray(arr, t);
+    }
+    return arr;
+}
+
+// --- builtin: set_timer ---------------------------------------------------------------------
+// One-shot countdown. The returned string is the agent-visible tool result; the live countdown and
+// the fire alert are surfaced by the UI/main, which POLL the two accessors below — this component
+// never calls into chat_ui (chat_ui already depends on device_tools, not the reverse).
+static esp_timer_handle_t s_timer_h;
+static volatile int64_t   s_timer_deadline_us;        // 0 = no active timer
+static volatile bool      s_timer_fired;
+static char               s_timer_label[40];
+
+static void timer_fire_cb(void *arg)
+{
+    (void)arg;
+    s_timer_deadline_us = 0;
+    s_timer_fired = true;
+    ESP_LOGI(TAG, "timer fired: %s", s_timer_label[0] ? s_timer_label : "(timer)");
+}
+
+static esp_err_t tool_set_timer(const cJSON *args, cJSON **result)
+{
+    const cJSON *secs  = cJSON_GetObjectItemCaseSensitive(args, "seconds");
+    const cJSON *label = cJSON_GetObjectItemCaseSensitive(args, "label");
+    int seconds = cJSON_IsNumber(secs) ? (int)secs->valuedouble : 0;
+    if (seconds <= 0 || seconds > 86400) {            // 1 s .. 24 h
+        if (result) *result = cJSON_CreateString("error: 'seconds' must be an integer 1..86400");
+        return ESP_OK;                                // a (negative) tool RESULT, not a dispatch failure
+    }
+    strlcpy(s_timer_label, (cJSON_IsString(label) && label->valuestring) ? label->valuestring : "",
+            sizeof s_timer_label);
+    if (!s_timer_h) {
+        const esp_timer_create_args_t ta = { .callback = timer_fire_cb, .name = "devtimer" };
+        if (esp_timer_create(&ta, &s_timer_h) != ESP_OK) {
+            if (result) *result = cJSON_CreateString("error: could not create timer");
+            return ESP_OK;
+        }
+    }
+    esp_timer_stop(s_timer_h);                        // replace any timer already running
+    s_timer_fired = false;
+    s_timer_deadline_us = esp_timer_get_time() + (int64_t)seconds * 1000000;
+    esp_timer_start_once(s_timer_h, (uint64_t)seconds * 1000000);
+    char msg[80];
+    snprintf(msg, sizeof msg, "Timer set for %d second%s%s%s", seconds, seconds == 1 ? "" : "s",
+             s_timer_label[0] ? ": " : "", s_timer_label);
+    if (result) *result = cJSON_CreateString(msg);
+    return ESP_OK;
+}
+
+int device_tools_timer_remaining(void)
+{
+    int64_t dl = s_timer_deadline_us;
+    if (dl == 0) return 0;
+    int64_t left = dl - esp_timer_get_time();
+    return left <= 0 ? 0 : (int)((left + 999999) / 1000000);
+}
+
+bool device_tools_timer_take_fired(char *label, size_t n)
+{
+    if (!s_timer_fired) return false;
+    s_timer_fired = false;
+    if (label && n) strlcpy(label, s_timer_label, n);
+    return true;
+}
+
+// Build a tool def {description, parameters} from a description + a JSON-Schema string.
+static cJSON *tool_def(const char *description, const char *params_schema_json)
+{
+    cJSON *d = cJSON_CreateObject();
+    if (!d) return NULL;
+    cJSON_AddStringToObject(d, "description", description);
+    cJSON *p = cJSON_Parse(params_schema_json);
+    if (p) cJSON_AddItemToObject(d, "parameters", p);
+    return d;
+}
+
+static void register_builtins(void)
+{
+    if (s_tool_count) return;   // idempotent
+    device_tools_register(
+        "set_timer",
+        tool_def("Start a countdown timer; the device alerts the user when it elapses.",
+                 "{\"type\":\"object\",\"properties\":{"
+                 "\"seconds\":{\"type\":\"integer\",\"description\":\"Duration in seconds (1-86400)\"},"
+                 "\"label\":{\"type\":\"string\",\"description\":\"Optional short name for the timer\"}},"
+                 "\"required\":[\"seconds\"]}"),
+        tool_set_timer);
+    // set_alarm (PCF85063 RTC) and show_qr (lv_qrcode) register here next.
 }

@@ -194,6 +194,37 @@ void add_context(agui::RunAgentParams& params, const cJSON* context) {
     }
 }
 
+// Convert a cJSON tool manifest [{name, description, parameters(JSON-Schema)}] into
+// RunAgentParams.tools so they serialize into RunAgentInput.tools (P7 client tools). Mirrors
+// add_context(). `parameters` is passed through verbatim as the JSON-Schema object.
+void add_tools(agui::RunAgentParams& params, const cJSON* tools) {
+    if (!tools || !cJSON_IsArray(tools)) return;
+    const cJSON* item = nullptr;
+    cJSON_ArrayForEach(item, tools) {
+        const cJSON* n = cJSON_GetObjectItemCaseSensitive(item, "name");
+        const cJSON* d = cJSON_GetObjectItemCaseSensitive(item, "description");
+        const cJSON* p = cJSON_GetObjectItemCaseSensitive(item, "parameters");
+        if (!cJSON_IsString(n) || !n->valuestring) continue;        // name is required
+
+        agui::Tool t;
+        t.name = n->valuestring;
+        if (cJSON_IsString(d) && d->valuestring) t.description = d->valuestring;
+
+        // No cJSON->nlohmann bridge exists; round-trip the schema subtree through a string.
+        // Default to an empty-object schema if absent/unparsable (a no-throw parse can't abort the turn).
+        t.parameters = nlohmann::json::object();
+        if (p) {
+            char* s = cJSON_PrintUnformatted(p);
+            if (s) {
+                auto parsed = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
+                if (!parsed.is_discarded()) t.parameters = std::move(parsed);
+                cJSON_free(s);
+            }
+        }
+        params.addTool(t);
+    }
+}
+
 }  // namespace
 
 extern "C" esp_err_t agui_client_init(void) {
@@ -206,7 +237,6 @@ extern "C" esp_err_t agui_client_init(void) {
 extern "C" esp_err_t agui_run(const agui_cfg_t* cfg, const char* user_text,
                               const cJSON* context, const cJSON* tools, const cJSON* resume,
                               const agui_handlers_t* handlers, void* ctx) {
-    (void)tools;    // advertised client tools — wired in P7
     (void)resume;   // interrupt resume payload — wired in P6
     if (!cfg || !cfg->endpoint || !handlers) return ESP_ERR_INVALID_ARG;
     if (!s_lock) agui_client_init();
@@ -229,6 +259,7 @@ extern "C" esp_err_t agui_run(const agui_cfg_t* cfg, const char* user_text,
         agui::RunAgentParams params;
         params.threadId = s_thread_id;
         add_context(params, context);
+        add_tools(params, tools);          // P7: advertise device client tools in RunAgentInput.tools
 
         bool ok = true;
         std::string errMsg;
@@ -260,8 +291,34 @@ extern "C" esp_err_t agui_run(const agui_cfg_t* cfg, const char* user_text,
     return ret;
 }
 
+// Append a client-tool RESULT to the agent's history so the next (continuation) run carries it.
+// The assistant(tool_calls) message is ALREADY in history (the SDK's EventHandler reconstructs it
+// during the run and never resets it), so we append exactly ONE Tool-role message keyed by the
+// matching toolCallId. Mutates s_agent, so it takes s_lock — it MUST be called BETWEEN runs from
+// run_agent_turn (ptt_task), never from a handler (which runs inside agui_run holding s_lock).
 extern "C" esp_err_t agui_tool_result(const char* tool_call_id, const cJSON* result) {
-    (void)tool_call_id;
-    (void)result;
-    return ESP_ERR_NOT_SUPPORTED;   // P7
+    if (!tool_call_id || !tool_call_id[0]) return ESP_ERR_INVALID_ARG;
+    if (!s_lock) agui_client_init();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    esp_err_t ret = ESP_FAIL;
+    try {
+        if (s_agent) {
+            // Tool message content is a string. A plain-string result is used as-is; structured
+            // results are JSON-serialized.
+            std::string content;
+            if (result && cJSON_IsString(result) && result->valuestring) {
+                content = result->valuestring;
+            } else if (result) {
+                char* s = cJSON_PrintUnformatted(result);
+                if (s) { content = s; cJSON_free(s); }
+            }
+            s_agent->addMessage(
+                agui::Message::create(agui::MessageRole::Tool, content, "", tool_call_id));
+            ret = ESP_OK;
+        }
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "tool_result failed: %s", e.what());
+    } catch (...) {}
+    xSemaphoreGive(s_lock);
+    return ret;
 }
