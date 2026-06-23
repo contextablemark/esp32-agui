@@ -23,6 +23,7 @@ static const char *TAG = "soniox";
 #define DEFAULT_SR       16000
 #define MIC_GAIN_DB      30.0f
 #define READ_CHUNK_BYTES 640           // 320 samples = 20 ms — tight DMA drain (capture frame)
+#define DRAIN_CHUNKS     8             // discard ~160ms at capture start (> the 8x300=150ms RX ring)
 #define WS_BUFFER_BYTES  8192          // WS tx/rx buffer; send_bin fragments payloads bigger than this
 #define SEND_MAX_BYTES   WS_BUFFER_BYTES // send up to one WS_BUFFER in a single transport write...
 #define SEND_TRIGGER     4096          // ...but wait for ~128ms of audio first, so each send is large
@@ -187,6 +188,14 @@ static void capture_task(void *arg)
 {
     uint8_t *buf = heap_caps_malloc(READ_CHUNK_BYTES, MALLOC_CAP_DEFAULT);
     if (buf) {
+        // The mic ADC + I2S RX DMA run continuously from boot, so at session start the ring
+        // (8x300 ≈ 150ms; auto_clear only clears TX, never RX) holds stale audio — including any
+        // PTT-beep crosstalk the shared ES8311 recorded while the beep played. Discard the whole
+        // ring so the transcript onset is clean. Also re-assert the mic gain: opening the speaker
+        // for the beep soft-resets the shared ES8311's ADC gain register back to its default.
+        esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
+        for (int i = 0; i < DRAIN_CHUNKS && !s_stop && !s_fatal; i++)
+            esp_codec_dev_read(s_mic, buf, READ_CHUNK_BYTES);   // flush stale/crosstalk; content discarded
         while (!s_stop && !s_fatal) {
             if (esp_codec_dev_read(s_mic, buf, READ_CHUNK_BYTES) != ESP_OK) continue;
             // Never block the mic. Drop the *whole* chunk if it won't fit (sender behind):

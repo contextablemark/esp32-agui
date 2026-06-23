@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -28,6 +29,9 @@
 #include "agui_client.h"
 #include "device_tools.h"
 #include "chat_ui.h"
+
+#include "esp_codec_dev.h"
+#include "bsp/esp32_s3_touch_amoled_1_8.h"
 
 static const char *TAG = "agui_voice";
 
@@ -158,6 +162,66 @@ static void run_agent_turn(const char *text)
     if (!s_run_error) chat_ui_status(IDLE_HINT);   // success → idle prompt; on error keep "Error" up
 }
 
+// ---- PTT "go ahead and talk" beep -------------------------------------------------------------
+// A short, subtle sine cue played on the ES8311 speaker the instant a hold starts. It plays from
+// ptt_task BEFORE soniox_session_start() creates capture_task, so it never glitches an in-flight
+// mic read. The speaker is a second esp_codec_dev OUT handle that coexists with the always-open mic
+// IN handle on the single ES8311; both MUST use the same 16k/16/1 format (the shared codec/I2S
+// clock's last set_fs wins — and it is NOT auto-enforced, so BEEP_SR is hard-pinned). Opening the
+// speaker soft-resets the shared chip (clobbers the mic ADC gain) and its acoustic crosstalk lands
+// in the live RX DMA ring — capture_task compensates by re-asserting the mic gain and draining the
+// ring before it forwards any audio (see soniox_client capture_task).
+#define BEEP_SR      16000   // MUST equal soniox_client DEFAULT_SR (the mic rate)
+#define BEEP_FREQ    950     // Hz — subtle mid/high, clear over a small speaker
+#define BEEP_MS      90      // duration
+#define BEEP_FADE_MS 6       // linear fade in AND out — kills edge clicks
+#define BEEP_AMPL    6000    // int16 peak (~0.18 FS): audible with ~5x headroom, cannot clip
+#define BEEP_VOL     75      // esp_codec_dev out-vol INDEX 0-100 (NOT dB; 0 would be -96 dB = silent)
+#define BEEP_SAMPLES (BEEP_SR * BEEP_MS / 1000)        // 1440
+#define BEEP_FADE_N  (BEEP_SR * BEEP_FADE_MS / 1000)   // 96
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+static esp_codec_dev_handle_t s_spk;              // speaker OUT handle, opened once and kept open
+static int16_t s_beep_pcm[BEEP_SAMPLES];          // precomputed once (~2.8 KB)
+static bool    s_beep_ready;
+
+// Fill s_beep_pcm with a BEEP_FREQ sine at 16k mono, with linear fade-in/out on the edges so the
+// buffer's start/end discontinuities don't click. Peak ±BEEP_AMPL ≈ 0.18 FS → mathematically can't clip.
+static void beep_pcm_build(void)
+{
+    const double w = 2.0 * M_PI * (double)BEEP_FREQ / (double)BEEP_SR;
+    for (int i = 0; i < BEEP_SAMPLES; i++) {
+        double env = 1.0;                                            // anti-click amplitude envelope
+        if (i < BEEP_FADE_N)                       env = (double)i / BEEP_FADE_N;
+        else if (i >= BEEP_SAMPLES - BEEP_FADE_N)  env = (double)(BEEP_SAMPLES - 1 - i) / BEEP_FADE_N;
+        s_beep_pcm[i] = (int16_t)lrint(sin(w * i) * env * BEEP_AMPL);
+    }
+    s_beep_ready = true;
+}
+
+// Lazily bring up the speaker (once) and play the cue. Blocks (~90 ms) until the tone is clocked out
+// of the I2S TX DMA, so capture then starts on silence. Call ONLY from ptt_task, never a button cb.
+static void play_ptt_beep(void)
+{
+    if (!s_beep_ready) beep_pcm_build();
+    if (!s_spk) {
+        s_spk = bsp_audio_codec_speaker_init();                 // pa_pin = GPIO46, raised automatically
+        if (!s_spk) { ESP_LOGW(TAG, "beep: speaker init failed"); return; }
+        esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);             // 0-100 index, NOT dB
+        esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = BEEP_SR };
+        if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) {         // same 16k as the mic → full-duplex OK
+            ESP_LOGW(TAG, "beep: speaker open failed");
+            s_spk = NULL;                                       // retry on the next press
+            return;
+        }
+        ESP_LOGI(TAG, "beep: speaker ready (16k mono)");
+    }
+    esp_codec_dev_write(s_spk, s_beep_pcm, sizeof s_beep_pcm);
+}
+
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
 static void ptt_task(void *arg)
 {
@@ -171,6 +235,7 @@ static void ptt_task(void *arg)
             s_listening = true;
             net_low_latency(true);                     // low-latency WiFi for the whole turn (mic + reply)
             chat_ui_status("Listening...");
+            play_ptt_beep();                           // "go ahead" cue; plays & returns before capture starts
             soniox_cfg_t scfg = { 0 };                 // api_key from NVS
             if (soniox_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
                 s_listening = false;

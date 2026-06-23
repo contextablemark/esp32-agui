@@ -11,4 +11,5 @@ idf_component_register(
         chat_ui
         board_variant
         esp32_s3_touch_amoled_1_8
+        esp_codec_dev
         espressif__button)
