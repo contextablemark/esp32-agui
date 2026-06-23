@@ -27,7 +27,7 @@ void  chat_ui_clear_status(void);
 void  chat_ui_show_qr(const char *data);   // lv_qrcode
 void  chat_ui_idle_timer(int seconds_left, const char *label);
 
-// Screen-power saver (P7): blank the AMOLED (brightness 0) after `idle_timeout_s` of no touch /
+// Screen-power saver: blank the AMOLED (brightness 0) after `idle_timeout_s` of no touch /
 // PTT / UI activity, and wake it on any of those. The PWR button (AXP2101 PWRKEY) short-press
 // TOGGLES the screen: on→off immediately (skip the timeout), off→on. Pass <=0 for the default
 // (60s). Starts a small background task; call once after chat_ui_init() and the device is ready.

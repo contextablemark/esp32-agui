@@ -209,7 +209,7 @@ void chat_ui_status(const char *text)
 
 void chat_ui_clear_status(void) { chat_ui_status("Ready"); }
 
-// --- screen-power saver (P7) -----------------------------------------------------------------
+// --- screen-power saver (power mgmt; standalone, not in the numbered phase plan) --------------
 // Blank the AMOLED (brightness 0 ≈ near-zero panel draw on OLED) after a span with no activity,
 // and wake on any input. Activity = touch (LVGL tracks it per input device), the PWR key (AXP2101
 // PWRKEY, polled via device_tools), or any UI mutation (the chat_ui_* setters call note_activity,
