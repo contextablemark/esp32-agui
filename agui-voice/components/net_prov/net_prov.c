@@ -146,6 +146,9 @@ esp_err_t net_prov_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
+    // Idle in power-saving modem-sleep; net_low_latency(true) flips this off for the duration
+    // of a turn (modem sleep adds ~100ms/round-trip and throttles the Soniox upload).
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     const esp_timer_create_args_t targs = { .callback = reconnect_cb, .name = "net_reconnect" };
     ESP_ERROR_CHECK(esp_timer_create(&targs, &s_reconnect_timer));
@@ -199,4 +202,10 @@ void net_start_auto_reconnect(void)
 {
     s_auto = true;
     if (!s_online) esp_wifi_connect();
+}
+
+void net_low_latency(bool on)
+{
+    // Idempotent; safe to call repeatedly. esp_wifi_set_ps applies at runtime once WiFi is started.
+    esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
 }

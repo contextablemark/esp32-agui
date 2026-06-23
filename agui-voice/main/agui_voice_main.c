@@ -157,10 +157,12 @@ static void ptt_task(void *arg)
             s_ptt_final[0] = '\0';
             s_ptt_run[0]   = '\0';
             s_listening = true;
+            net_low_latency(true);                     // low-latency WiFi for the whole turn (mic + reply)
             chat_ui_status("Listening...");
             soniox_cfg_t scfg = { 0 };                 // api_key from NVS
             if (soniox_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
                 s_listening = false;
+                net_low_latency(false);                // no turn will run; restore power-save now
                 chat_ui_status("STT error");
                 ESP_LOGE(TAG, "STT failed to start");
             }
@@ -175,6 +177,7 @@ static void ptt_task(void *arg)
             while (n && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n')) t[--n] = '\0';
             if (*t) run_agent_turn(t);             // owns its terminal status (idle hint / "Error")
             else    chat_ui_status(IDLE_HINT);
+            net_low_latency(false);                // turn done (reply streamed) → back to power-save
 
         } else if (ev == 2 && !s_listening) {      // DOUBLE-TAP → reopen setup portal (change endpoint etc.)
             chat_ui_status("Setup: join 'AMOLED-setup'");

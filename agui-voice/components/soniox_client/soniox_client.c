@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/stream_buffer.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "cJSON.h"
@@ -21,7 +22,12 @@ static const char *TAG = "soniox";
 #define DEFAULT_MODEL    "stt-rt-v5"
 #define DEFAULT_SR       16000
 #define MIC_GAIN_DB      30.0f
-#define PCM_CHUNK_BYTES  3840          // 1920 samples = 120 ms @ 16k/mono/s16le
+#define READ_CHUNK_BYTES 640           // 320 samples = 20 ms — tight DMA drain (capture frame)
+#define WS_BUFFER_BYTES  8192          // WS tx/rx buffer; send_bin fragments payloads bigger than this
+#define SEND_MAX_BYTES   WS_BUFFER_BYTES // send up to one WS_BUFFER in a single transport write...
+#define SEND_TRIGGER     4096          // ...but wait for ~128ms of audio first, so each send is large
+                                       // enough to amortize TCP delayed-ACK (~200ms/write at this RTT)
+#define AUDIO_SB_BYTES   (32 * 1024)   // ~1 s of 16k mono s16le — bounds worst-case latency (PSRAM)
 #define COMMITTED_MAX    512
 #define RUNNING_MAX      640
 #define MSG_MAX          32768         // reject pathologically large server messages
@@ -30,7 +36,12 @@ static esp_codec_dev_handle_t        s_mic;
 static esp_websocket_client_handle_t s_ws;
 static SemaphoreHandle_t             s_lock;       // serializes start/finalize/stop
 static SemaphoreHandle_t             s_cap_done;   // capture task signals exit
+static SemaphoreHandle_t             s_send_done;  // sender task signals exit
 static TaskHandle_t                  s_cap_task;
+static TaskHandle_t                  s_send_task;
+static StreamBufferHandle_t          s_audio_sb;   // mic (producer) -> WSS (consumer), PSRAM
+static StaticStreamBuffer_t          s_sb_ctrl;
+static uint8_t                      *s_sb_storage; // PSRAM backing for s_audio_sb
 static volatile bool                 s_stop;
 static volatile bool                 s_fatal;      // fatal Soniox error -> session dead
 static volatile bool                 s_need_config;// (re)send config after (re)connect
@@ -167,30 +178,64 @@ static esp_err_t send_config_frame(void)
     return n < 0 ? ESP_FAIL : ESP_OK;
 }
 
-// ---- capture task: mic -> binary WS frames -------------------------------
+// ---- capture (producer): mic -> ring buffer ------------------------------
+// Tight loop that does NOTHING but drain the I2S DMA into s_audio_sb in small
+// 20ms reads. Decoupled from the network so a stalled TLS send can never starve
+// the mic (a single read+send task dropped frames to DMA overrun during sends).
 
 static void capture_task(void *arg)
 {
-    uint8_t *buf = heap_caps_malloc(PCM_CHUNK_BYTES, MALLOC_CAP_DEFAULT);
+    uint8_t *buf = heap_caps_malloc(READ_CHUNK_BYTES, MALLOC_CAP_DEFAULT);
     if (buf) {
         while (!s_stop && !s_fatal) {
-            if (!esp_websocket_client_is_connected(s_ws)) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
-            if (s_need_config) {
-                if (send_config_frame() == ESP_OK) s_need_config = false;
-                else { vTaskDelay(pdMS_TO_TICKS(200)); continue; }
-            }
-            if (esp_codec_dev_read(s_mic, buf, PCM_CHUNK_BYTES) == ESP_OK &&
-                !s_stop && esp_websocket_client_is_connected(s_ws)) {
-                esp_websocket_client_send_bin(s_ws, (const char *)buf, PCM_CHUNK_BYTES, pdMS_TO_TICKS(500));
-            }
+            if (esp_codec_dev_read(s_mic, buf, READ_CHUNK_BYTES) != ESP_OK) continue;
+            // Never block the mic. Drop the *whole* chunk if it won't fit (sender behind):
+            // a partial write would split a 16-bit sample and desync 2-byte alignment for
+            // the rest of the stream. Dropping a full even-sized chunk keeps alignment.
+            if (xStreamBufferSpacesAvailable(s_audio_sb) >= READ_CHUNK_BYTES)
+                xStreamBufferSend(s_audio_sb, buf, READ_CHUNK_BYTES, 0);
         }
         heap_caps_free(buf);
     } else {
         ESP_LOGE(TAG, "no mem for capture buf");
     }
-    // From here on we no longer touch s_ws — safe for stop() to destroy it.
     s_cap_task = NULL;
     xSemaphoreGive(s_cap_done);
+    vTaskDelete(NULL);
+}
+
+// ---- sender (consumer): ring buffer -> binary WS frames -------------------
+// Owns s_ws while the session runs. On stop it drains whatever audio remains in
+// the ring buffer (the producer has already joined) before signalling done, so
+// stop() can safely destroy s_ws.
+
+static void sender_task(void *arg)
+{
+    uint8_t *buf = heap_caps_malloc(SEND_MAX_BYTES, MALLOC_CAP_DEFAULT);
+    if (buf) {
+        while (true) {
+            if (!esp_websocket_client_is_connected(s_ws)) {
+                if (s_stop || s_fatal) break;
+                vTaskDelay(pdMS_TO_TICKS(50));    // wait for connect; producer keeps buffering
+                continue;
+            }
+            if (s_need_config) {
+                if (send_config_frame() == ESP_OK) s_need_config = false;
+                else vTaskDelay(pdMS_TO_TICKS(100));
+                continue;
+            }
+            size_t n = xStreamBufferReceive(s_audio_sb, buf, SEND_MAX_BYTES, pdMS_TO_TICKS(100));
+            if (n == 0) { if (s_stop || s_fatal) break; continue; }   // stop + drained -> exit
+            if (s_fatal) continue;
+            esp_websocket_client_send_bin(s_ws, (const char *)buf, n, pdMS_TO_TICKS(500));
+        }
+        heap_caps_free(buf);
+    } else {
+        ESP_LOGE(TAG, "no mem for sender buf");
+    }
+    // From here on we no longer touch s_ws — safe for stop() to destroy it.
+    s_send_task = NULL;
+    xSemaphoreGive(s_send_done);
     vTaskDelete(NULL);
 }
 
@@ -200,6 +245,12 @@ esp_err_t soniox_client_init(void)
 {
     if (!s_lock) s_lock = xSemaphoreCreateMutex();
     if (!s_cap_done) s_cap_done = xSemaphoreCreateBinary();
+    if (!s_send_done) s_send_done = xSemaphoreCreateBinary();
+    if (!s_audio_sb) {
+        s_sb_storage = heap_caps_malloc(AUDIO_SB_BYTES + 1, MALLOC_CAP_SPIRAM);
+        if (!s_sb_storage) { ESP_LOGE(TAG, "no PSRAM for audio ring buffer"); return ESP_ERR_NO_MEM; }
+        s_audio_sb = xStreamBufferCreateStatic(AUDIO_SB_BYTES, SEND_TRIGGER, s_sb_storage, &s_sb_ctrl);
+    }
     if (s_mic) return ESP_OK;
     s_mic = bsp_audio_codec_microphone_init();
     if (!s_mic) { ESP_LOGE(TAG, "mic init failed"); return ESP_FAIL; }
@@ -242,11 +293,13 @@ esp_err_t soniox_session_start(const soniox_cfg_t *cfg,
     s_stop = false;
     s_fatal = false;
     s_need_config = true;
-    xSemaphoreTake(s_cap_done, 0);   // drain any stale signal from a prior session
+    xSemaphoreTake(s_cap_done, 0);    // drain any stale signal from a prior session
+    xSemaphoreTake(s_send_done, 0);
+    xStreamBufferReset(s_audio_sb);   // discard any audio left from a prior session
 
     esp_websocket_client_config_t wcfg = {
         .uri = endpoint,
-        .buffer_size = 4096,
+        .buffer_size = WS_BUFFER_BYTES,   // big enough that one batched audio send = one transport write
         .task_stack = 8192,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .reconnect_timeout_ms = 5000,
@@ -260,7 +313,13 @@ esp_err_t soniox_session_start(const soniox_cfg_t *cfg,
     if (err != ESP_OK) { esp_websocket_client_destroy(s_ws); s_ws = NULL; xSemaphoreGive(s_lock); return err; }
 
     s_active = true;
-    if (xTaskCreate(capture_task, "soniox_cap", 4096, NULL, 5, &s_cap_task) != pdPASS) {
+    // Producer at higher priority than consumer: draining the mic DMA is real-time
+    // critical; the network send can wait.
+    if (xTaskCreate(capture_task, "soniox_cap", 4096, NULL, 6, &s_cap_task) != pdPASS ||
+        xTaskCreate(sender_task,  "soniox_snd", 4096, NULL, 5, &s_send_task) != pdPASS) {
+        s_stop = true;
+        if (s_cap_task) xSemaphoreTake(s_cap_done, portMAX_DELAY);
+        if (s_send_task) xSemaphoreTake(s_send_done, portMAX_DELAY);
         esp_websocket_client_stop(s_ws);
         esp_websocket_client_destroy(s_ws);
         s_ws = NULL;
@@ -291,8 +350,11 @@ void soniox_session_stop(void)
     xSemaphoreTake(s_lock, portMAX_DELAY);
     if (!s_active) { xSemaphoreGive(s_lock); return; }
     s_stop = true;
-    if (s_cap_task) xSemaphoreTake(s_cap_done, portMAX_DELAY);  // deterministic join
-    esp_websocket_client_handle_t ws = s_ws;   // capture no longer touches s_ws
+    // Join producer first (stops filling the buffer), then the sender, which drains
+    // whatever audio remains before it stops touching s_ws.
+    if (s_cap_task) xSemaphoreTake(s_cap_done, portMAX_DELAY);
+    if (s_send_task) xSemaphoreTake(s_send_done, portMAX_DELAY);
+    esp_websocket_client_handle_t ws = s_ws;   // tasks no longer touch s_ws
     s_ws = NULL;
     if (ws) {
         // Close the socket directly (destroy() → TCP FIN). Deliberately do NOT send Soniox's

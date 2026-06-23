@@ -30,6 +30,11 @@ bool net_get_ip_str(char *buf, size_t len);
 // Start auto-reconnect with backoff for mid-session drops.
 void net_start_auto_reconnect(void);
 
+// Toggle WiFi modem-sleep. true = WIFI_PS_NONE (low latency, higher power) for the duration of a
+// turn (mic streaming + agent reply); false = WIFI_PS_MIN_MODEM (default, power-saving) when idle.
+// Default modem-sleep adds ~100ms/round-trip which throttles the Soniox upload — see soniox_client.
+void net_low_latency(bool on);
+
 // NVS credential list management.
 esp_err_t net_creds_add(const char *ssid, const char *pass);
 esp_err_t net_creds_clear(void);
