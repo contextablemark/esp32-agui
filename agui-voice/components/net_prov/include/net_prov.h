@@ -34,6 +34,13 @@ void net_start_auto_reconnect(void);
 // Call once after WiFi is up; it syncs in the background.
 void net_sntp_start(void);
 
+// True once the clock has been set (by SNTP or the HTTPS-Date fallback).
+bool net_time_synced(void);
+
+// Fallback time source for networks that block NTP: read an HTTPS server's Date header and set the
+// clock. No-op once already synced. Safe to call repeatedly (e.g. from a heartbeat) until it succeeds.
+esp_err_t net_time_http_fallback(void);
+
 // Toggle WiFi modem-sleep. true = WIFI_PS_NONE (low latency, higher power) for the duration of a
 // turn (mic streaming + agent reply); false = WIFI_PS_MIN_MODEM (default, power-saving) when idle.
 // Default modem-sleep adds ~100ms/round-trip which throttles the Soniox upload — see soniox_client.

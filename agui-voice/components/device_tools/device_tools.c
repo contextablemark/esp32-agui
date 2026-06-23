@@ -28,16 +28,17 @@ static void ctx_add(cJSON *arr, const char *description, const char *value)
     cJSON_AddItemToArray(arr, item);
 }
 
-// local_time → ISO-8601 UTC (trailing 'Z'). Only emitted once SNTP has set a real clock — before
-// that the system clock is the 1970 boot epoch, and a wrong time is worse than none.
+// local_time → ISO-8601 with numeric offset (e.g. 2026-06-23T13:00:00-0500; UTC → +0000). The TZ
+// is applied at boot from the "tz" config (POSIX TZ string, default UTC0). Only emitted once the
+// clock has been set — before that it's the 1970 boot epoch, and a wrong time is worse than none.
 static void add_local_time(cJSON *arr)
 {
     time_t now = time(NULL);
     if (now < 1700000000) return;   // ~2023-11; below this the clock hasn't synced yet
-    struct tm utc;
-    gmtime_r(&now, &utc);
-    char iso[32];
-    strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", &utc);
+    struct tm lt;
+    localtime_r(&now, &lt);
+    char iso[40];
+    strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%S%z", &lt);
     ctx_add(arr, "local_time", iso);
 }
 

@@ -15,6 +15,8 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 
+#include "tz_options.h"   // auto-generated <option> list: IANA label -> POSIX TZ value
+
 static const char *TAG = "net_portal";
 
 #define PBIT_SAVED BIT0
@@ -26,11 +28,15 @@ static EventGroupHandle_t s_portal_eg;
 static TaskHandle_t       s_dns_task;
 static volatile bool      s_dns_run;
 
-static const char FORM[] =
+// The page is sent in three chunks: HEAD + the (~24 KB) TZ_OPTIONS + TAIL. The timezone <select>
+// carries the IANA name as the label and the POSIX TZ string as the option value, so the device
+// just stores the submitted value (no on-device IANA table). A tiny script pre-selects the phone's
+// own timezone via Intl, so the user normally doesn't touch it.
+static const char FORM_HEAD[] =
     "<!doctype html><html><head><meta name=viewport "
     "content='width=device-width,initial-scale=1'><title>AMOLED setup</title>"
     "<style>body{font-family:sans-serif;margin:2em;max-width:30em}"
-    "input{display:block;width:100%;padding:.6em;margin:.4em 0;font-size:1em}"
+    "input,select{display:block;width:100%;padding:.6em;margin:.4em 0;font-size:1em}"
     "button{padding:.7em 1.2em;font-size:1em}</style></head><body>"
     "<h2>AG-UI device setup</h2>"
     "<form method=POST action=/save>"
@@ -39,9 +45,18 @@ static const char FORM[] =
     "<label>Soniox API key</label><input name=soniox>"
     "<label>AG-UI endpoint URL</label><input name=agui_url>"
     "<label>AG-UI bearer token (optional)</label><input name=agui_token>"
-    "<p style='color:#666;font-size:.85em'>Leave WiFi blank if already connected; "
-    "fill the Soniox key to enable voice and the AG-UI URL to enable the agent.</p>"
-    "<button type=submit>Save &amp; connect</button></form></body></html>";
+    "<label>Timezone</label><select name=tz>";
+// ... TZ_OPTIONS injected here ...
+static const char FORM_TAIL[] =
+    "</select>"
+    "<p style='color:#666;font-size:.85em'>Timezone is auto-detected from your phone; change it if "
+    "needed. Leave WiFi blank if already connected; fill the Soniox key to enable voice and the "
+    "AG-UI URL to enable the agent.</p>"
+    "<button type=submit>Save &amp; connect</button></form>"
+    "<script>try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone,"
+    "s=document.querySelector('select[name=tz]');"
+    "for(var i=0;i<s.options.length;i++){if(s.options[i].text===z){s.selectedIndex=i;break;}}}"
+    "catch(e){}</script></body></html>";
 
 // ---- tiny form helpers ---------------------------------------------------
 
@@ -99,12 +114,15 @@ static esp_err_t root_get(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");   // always serve the current form (no stale cache)
-    return httpd_resp_send(req, FORM, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, FORM_HEAD, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send_chunk(req, TZ_OPTIONS, HTTPD_RESP_USE_STRLEN);   // ~24 KB timezone <option> list
+    httpd_resp_send_chunk(req, FORM_TAIL, HTTPD_RESP_USE_STRLEN);
+    return httpd_resp_send_chunk(req, NULL, 0);              // terminate the chunked response
 }
 
 static esp_err_t save_post(httpd_req_t *req)
 {
-    static char body[1280];   // urlencoded fields; static (httpd is single-threaded) keeps it off the stack
+    static char body[2048];   // urlencoded fields (now incl. tz); static (httpd is single-threaded) keeps it off the stack
     int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
     int got = 0;
     while (got < total) {
@@ -115,14 +133,15 @@ static esp_err_t save_post(httpd_req_t *req)
     body[got] = '\0';
 
     char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
-    char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0};
+    char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0}, tz[64] = {0};
     bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
     bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
     bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
     bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
-    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d  (agui_url field in body=%d)",
-             got, have_ssid, have_soniox, have_url, have_token, strstr(body, "agui_url=") != NULL);
-    if (!have_ssid && !have_soniox && !have_url && !have_token) {
+    bool have_tz     = form_field(body, "tz", tz, sizeof(tz)) && tz[0];
+    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d  (agui_url field in body=%d)",
+             got, have_ssid, have_soniox, have_url, have_token, have_tz, strstr(body, "agui_url=") != NULL);
+    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -133,6 +152,7 @@ static esp_err_t save_post(httpd_req_t *req)
     if (have_soniox) app_cfg_set(APP_CFG_SONIOX_KEY, soniox);
     if (have_url)    app_cfg_set(APP_CFG_AGUI_URL, agui_url);
     if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
+    if (have_tz)     app_cfg_set(APP_CFG_TZ, tz);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -145,12 +165,14 @@ static esp_err_t save_post(httpd_req_t *req)
         "<li>Soniox key: <b>%s</b></li>"
         "<li>AG-UI URL: <b>%s</b></li>"
         "<li>AG-UI token: <b>%s</b></li>"
+        "<li>Timezone: <b>%s</b></li>"
         "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
         "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
         have_ssid ? "updated" : "unchanged",
         have_soniox ? "updated" : "unchanged",
         have_url ? agui_url : "unchanged",
-        have_token ? "updated" : "unchanged");
+        have_token ? "updated" : "unchanged",
+        have_tz ? tz : "unchanged");
     httpd_resp_sendstr(req, resp);
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
     return ESP_OK;

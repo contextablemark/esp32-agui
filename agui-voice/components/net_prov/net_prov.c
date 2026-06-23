@@ -6,6 +6,8 @@
 #include "net_prov_internal.h"
 
 #include <string.h>
+#include <time.h>
+#include <sys/time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
@@ -14,9 +16,25 @@
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_http_client.h"
+#include "esp_crt_bundle.h"
 #include "nvs.h"
 
 static const char *TAG = "net_prov";
+
+// struct tm (interpreted as UTC) -> time_t, without timegm (absent from ESP-IDF newlib) and without
+// mutating the global TZ. Howard Hinnant's days_from_civil. Valid for the dates we'll ever see.
+static time_t tm_to_utc(const struct tm *tm)
+{
+    int y = tm->tm_year + 1900, m = tm->tm_mon + 1, d = tm->tm_mday;
+    y -= m <= 2;
+    int era = (y >= 0 ? y : y - 399) / 400;
+    unsigned yoe = (unsigned)(y - era * 400);
+    unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+    unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    long days = (long)era * 146097 + (long)doe - 719468;
+    return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
+}
 
 #define NVS_NS         "netprov"
 #define KEY_COUNT      "count"
@@ -211,6 +229,18 @@ void net_low_latency(bool on)
     esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
 }
 
+static volatile bool s_time_synced;   // true once the clock holds real time (SNTP or HTTP fallback)
+
+static void on_sntp_sync(struct timeval *tv)
+{
+    (void)tv;
+    s_time_synced = true;
+    time_t now = time(NULL);
+    struct tm utc; gmtime_r(&now, &utc);
+    char iso[32]; strftime(iso, sizeof iso, "%Y-%m-%dT%H:%M:%SZ", &utc);
+    ESP_LOGI(TAG, "time synced via SNTP: %s", iso);
+}
+
 void net_sntp_start(void)
 {
     // One-shot SNTP for wall-clock time (P5 ambient context "local_time"). Call once after WiFi is
@@ -218,7 +248,45 @@ void net_sntp_start(void)
     static bool started;
     if (started) return;
     esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    cfg.sync_cb = on_sntp_sync;   // log + flag when the clock is actually set
     esp_err_t e = esp_netif_sntp_init(&cfg);
     if (e == ESP_OK) { started = true; ESP_LOGI(TAG, "SNTP started (pool.ntp.org)"); }
     else ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(e));
+}
+
+bool net_time_synced(void) { return s_time_synced; }
+
+esp_err_t net_time_http_fallback(void)
+{
+    // Time-via-HTTPS for networks that block NTP (UDP/123) — common on hotspots/guest WiFi. HEAD a
+    // tiny TLS endpoint, parse the server's Date: header (RFC 1123, UTC) -> settimeofday. Cheap; the
+    // heartbeat retries it until the clock is set, then stops.
+    if (s_time_synced) return ESP_OK;
+    esp_http_client_config_t hcfg = {
+        .url               = "https://www.google.com/generate_204",
+        .method            = HTTP_METHOD_HEAD,
+        .timeout_ms        = 8000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+    };
+    esp_http_client_handle_t c = esp_http_client_init(&hcfg);
+    if (!c) return ESP_FAIL;
+    esp_err_t ret = ESP_FAIL;
+    if (esp_http_client_perform(c) == ESP_OK) {
+        char *date = NULL;
+        if (esp_http_client_get_header(c, "Date", &date) == ESP_OK && date) {
+            struct tm tm = {0};   // e.g. "Wed, 23 Jun 2026 18:00:00 GMT"
+            if (strptime(date, "%a, %d %b %Y %H:%M:%S", &tm)) {
+                time_t t = tm_to_utc(&tm);
+                if (t > 1700000000) {
+                    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+                    settimeofday(&tv, NULL);
+                    s_time_synced = true;
+                    ESP_LOGI(TAG, "time set via HTTPS Date: %s", date);
+                    ret = ESP_OK;
+                }
+            }
+        }
+    }
+    esp_http_client_cleanup(c);
+    return ret;
 }

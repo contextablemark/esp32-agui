@@ -13,6 +13,7 @@ extern "C" {
 #define APP_CFG_SONIOX_KEY "soniox_key"   // Soniox API key (permanent; ephemeral mint is P8)
 #define APP_CFG_AGUI_URL   "agui_url"     // AG-UI endpoint (P2)
 #define APP_CFG_AGUI_TOKEN "agui_token"   // AG-UI bearer (P2)
+#define APP_CFG_TZ         "tz"           // POSIX TZ string for local_time context (P5; default UTC0)
 
 // Max stored value length (incl. NUL). One number shared by the portal form, the NVS
 // writer, and every reader so a long value can't pass provisioning then fail to load.

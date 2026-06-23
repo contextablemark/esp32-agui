@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -46,6 +47,15 @@ static void init_nvs(void)
         err = nvs_flash_init();
     }
     ESP_ERROR_CHECK(err);
+}
+
+// Apply the configured POSIX TZ (from the portal dropdown; default UTC0) so localtime_r() yields
+// local time for the local_time ambient-context entry. Re-call after a reconfigure that may change it.
+static void apply_timezone(void)
+{
+    char tz[64];
+    setenv("TZ", (app_cfg_get(APP_CFG_TZ, tz, sizeof tz) && tz[0]) ? tz : "UTC0", 1);
+    tzset();
 }
 
 // --- Soniox transcript callbacks (fire from the ws task; only meaningful while holding PTT) ---
@@ -188,6 +198,7 @@ static void ptt_task(void *arg)
             bool saved = net_portal_wait_saved(180000);   // up to 3 min, then auto-close
             net_portal_stop();
             ESP_LOGI(TAG, "reconfigure: %s", saved ? "saved" : "timed out");
+            if (saved) apply_timezone();   // P5: TZ may have changed in the portal
             chat_ui_status(IDLE_HINT);
         }
     }
@@ -235,6 +246,7 @@ void app_main(void)
         net_portal_stop();
     }
     net_start_auto_reconnect();
+    apply_timezone();                  // P5: load POSIX TZ (default UTC0) for local_time
     net_sntp_start();                  // P5: sync wall-clock time for ambient context (local_time)
     ESP_LOGI(TAG, "network + keys ready");
 
@@ -254,7 +266,8 @@ void app_main(void)
     char ip[16];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(15000));
-        if (net_get_ip_str(ip, sizeof ip))
+        if (net_get_ip_str(ip, sizeof ip)) {
+            if (!net_time_synced()) net_time_http_fallback();   // P5: set clock via HTTPS if NTP is blocked
             // internal_max = largest contiguous internal block — TLS/lwIP send buffers need
             // contiguous internal RAM, so this matters more than total free when sessions fail.
             ESP_LOGI(TAG, "heartbeat: online ip=%s listening=%d free=%u internal=%u internal_max=%u psram=%u",
@@ -262,7 +275,8 @@ void app_main(void)
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-        else
+        } else {
             ESP_LOGW(TAG, "heartbeat: offline");
+        }
     }
 }
