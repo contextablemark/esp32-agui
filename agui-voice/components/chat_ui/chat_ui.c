@@ -26,6 +26,12 @@ static const char *TAG = "chat_ui";
 #define COL_ASSIST    0x2C2C2E   // dark grey
 #define MAX_BUBBLES   30         // prune oldest rows beyond this
 #define CHAT_FONT     (&lv_font_montserrat_20)   // bubbles + status line (one place to retune)
+// Cap chars per assistant bubble so one long reply can't become a multi-thousand-px LONG_WRAP label
+// (heavy to re-measure on every streamed delta and to redraw when scrolled). At ~234px wrap /
+// Montserrat 20 (~23 ch/line) 700 chars ≈ ~30 lines ≈ ~720px tall: cheap to render, and overflow
+// spills into a new bubble. (Coordinate overflow is handled separately by LV_USE_LARGE_COORD=y, so
+// this cap is about render cost / throughput, not the coord ceiling.)
+#define ASSIST_BUBBLE_MAX_CHARS  700
 
 #define SCREEN_ON_BRIGHTNESS   90       // % brightness when awake
 #define SCREEN_IDLE_TIMEOUT_MS 60000    // default: blank the AMOLED after this much inactivity
@@ -116,6 +122,19 @@ static lv_obj_t *add_bubble(bool user, uint32_t color, const char *text)
     return lbl;
 }
 
+// Screen-power state shared by the activity hook (below) and screen_power_task. Defined here so the
+// LVGL event cb installed in chat_ui_init can stamp activity; the rest of the saver lives lower down.
+static volatile uint32_t s_last_activity_ms;           // monotonic ms of last activity (touch/UI/PWR)
+static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
+
+// LVGL event cb: any touch/scroll on the UI is "activity". Runs inside the LVGL task (lock already
+// held by lv_timer_handler), so it just stamps the time — no lock, no I2C, no contention.
+static void chat_ui_activity_evt_cb(lv_event_t *e)
+{
+    (void)e;
+    s_last_activity_ms = now_ms();
+}
+
 esp_err_t chat_ui_init(void)
 {
     if (!bsp_display_start()) { ESP_LOGE(TAG, "bsp_display_start failed"); return ESP_FAIL; }
@@ -152,6 +171,16 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_scroll_dir(s_chat, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(s_chat, LV_SCROLLBAR_MODE_OFF);
 
+    // Touch/scroll = activity for the screen-power saver. This event cb runs INSIDE the LVGL task
+    // (already holding lvgl_mutex), so it bumps s_last_activity_ms without ever taking a lock — i.e.
+    // it works even when screen_power_task can't grab the lock to read lv_disp_get_inactive_time().
+    // Cover the chat list (scroll) and the screen (raw press/release) so reading/flinging keeps the
+    // panel awake. LV_EVENT_PRESSING/SCROLL fire continuously, so the screen never blanks mid-gesture.
+    lv_obj_add_event_cb(s_chat, chat_ui_activity_evt_cb, LV_EVENT_SCROLL, NULL);
+    lv_obj_add_event_cb(s_chat, chat_ui_activity_evt_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(scr,    chat_ui_activity_evt_cb, LV_EVENT_PRESSING, NULL);
+    lv_obj_add_event_cb(scr,    chat_ui_activity_evt_cb, LV_EVENT_RELEASED, NULL);
+
     bsp_display_unlock();
     bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
     ESP_LOGI(TAG, "chat UI up (%dx%d, LVGL 8.4)", BSP_LCD_H_RES, BSP_LCD_V_RES);
@@ -182,11 +211,39 @@ void chat_ui_append_assistant(const char *delta)
 {
     chat_ui_note_activity();
     if (!s_assist_lbl || !delta || !bsp_display_lock(1000)) return;
-    size_t dl = strlen(delta);
-    if (s_assist_len + dl < sizeof(s_assist_buf)) {     // accumulate, then re-measure+wrap the whole text
-        memcpy(s_assist_buf + s_assist_len, delta, dl);
-        s_assist_len += dl;
+
+    // Consume the whole delta byte-by-byte, spilling into a fresh assistant bubble whenever the
+    // current one hits ASSIST_BUBBLE_MAX_CHARS. This (a) never silently drops text the way the old
+    // fixed-buffer cap did, and (b) keeps every label short → cheap to re-measure/redraw and the
+    // flex-column height stays well under the lv_coord_t ceiling. We break at a space near the cap
+    // so words aren't split mid-token; if there's no recent space we hard-break.
+    for (size_t i = 0; delta[i]; ) {
+        // If the current bubble is full, finalize it and open a new one (continuation).
+        if (s_assist_len >= ASSIST_BUBBLE_MAX_CHARS) {
+            // Prefer to break at the last space so the new bubble starts on a word boundary.
+            size_t br = s_assist_len;
+            while (br > ASSIST_BUBBLE_MAX_CHARS - 80 && br > 0 && s_assist_buf[br - 1] != ' ') br--;
+            char carry[80];
+            size_t carry_len = 0;
+            if (br > ASSIST_BUBBLE_MAX_CHARS - 80 && br < s_assist_len) {   // found a space: move tail
+                carry_len = s_assist_len - br;
+                memcpy(carry, s_assist_buf + br, carry_len);
+                s_assist_buf[br] = '\0';
+                apply_wrapped(s_assist_lbl, s_assist_buf);                  // re-render trimmed bubble
+            }
+            s_assist_lbl = add_bubble(false, COL_ASSIST, "");              // continuation bubble
+            memcpy(s_assist_buf, carry, carry_len);
+            s_assist_len = carry_len;
+            s_assist_buf[s_assist_len] = '\0';
+        }
+        // Append as much of the remaining delta as fits before the per-bubble cap.
+        size_t room = ASSIST_BUBBLE_MAX_CHARS - s_assist_len;
+        size_t take = 0;
+        while (take < room && delta[i + take]) take++;
+        memcpy(s_assist_buf + s_assist_len, delta + i, take);
+        s_assist_len += take;
         s_assist_buf[s_assist_len] = '\0';
+        i += take;
         apply_wrapped(s_assist_lbl, s_assist_buf);
     }
     scroll_bottom();
@@ -216,13 +273,10 @@ void chat_ui_clear_status(void) { chat_ui_status("Ready"); }
 // which covers PTT turns + streaming replies). A separate low-priority task polls so the I2C PWR-key
 // read never runs under the LVGL lock. This is distinct from chat_ui_idle_timer (the set_timer
 // countdown shown on the idle screen), below.
-static volatile uint32_t s_last_activity_ms;            // monotonic ms of last non-touch activity
 static uint32_t          s_idle_timeout_ms = SCREEN_IDLE_TIMEOUT_MS;
 static bool              s_screen_on = true;
 static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
 static uint32_t          s_force_off_ms;                // when the force-off press happened
-
-static inline uint32_t now_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 
@@ -241,11 +295,28 @@ static void screen_power_task(void *arg)
             else             { s_force_off_armed = false; chat_ui_note_activity(); }
         }
 
-        uint32_t touch_idle = UINT32_MAX;                             // ms since last touch (LVGL-tracked)
-        if (bsp_display_lock(50)) { touch_idle = lv_disp_get_inactive_time(NULL); bsp_display_unlock(); }
+        // Idle accounting is now driven entirely by s_last_activity_ms, which is stamped by every UI
+        // mutation, PTT/PWR press, AND every touch/scroll event (chat_ui_activity_evt_cb, installed in
+        // chat_ui_init). So we no longer read lv_disp_get_inactive_time under the LVGL lock — that read
+        // was the sole reason this task contended bsp_display_lock(50) every 200ms, and it timed out
+        // (flooding "Failed to acquire LVGL lock") exactly when the LVGL task was busy rendering a long
+        // reply / heavy scroll. A busy LVGL task means the user is interacting: the opposite of idle, so
+        // there is nothing to gain by reading it. Keep one cheap, non-contending peek with a generous
+        // timeout purely as a backstop, and on failure treat BUSY as activity (do not blank).
         uint32_t now = now_ms();
-        uint32_t act_age = now - s_last_activity_ms;                  // ms since last UI/PTT/PWR-wake
-        uint32_t idle = touch_idle < act_age ? touch_idle : act_age; // youngest activity of any kind
+        if (!s_screen_on || (now - s_last_activity_ms) >= (s_idle_timeout_ms - SCREEN_POLL_MS)) {
+            // Only near the blank threshold (or while already off) do we briefly try the lock, with a
+            // long timeout so it rarely fails; success refreshes touch idle, failure = LVGL busy = active.
+            if (bsp_display_lock(200)) {
+                uint32_t ti = lv_disp_get_inactive_time(NULL);
+                bsp_display_unlock();
+                if (ti < (now - s_last_activity_ms)) s_last_activity_ms = now - ti;   // touch is newer
+            } else {
+                s_last_activity_ms = now;   // LVGL busy → treat as activity, never blank mid-render
+            }
+        }
+        uint32_t act_age = now - s_last_activity_ms;                  // ms since last activity of any kind
+        uint32_t idle = act_age;
 
         if (s_force_off_armed && idle < (now - s_force_off_ms))
             s_force_off_armed = false;                               // activity after the press → unarm

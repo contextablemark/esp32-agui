@@ -59,6 +59,10 @@ CONFIG_LV_COLOR_16_SWAP=y
 CONFIG_LV_COLOR_SCREEN_TRANSP=y
 CONFIG_LV_MEM_CUSTOM=y
 CONFIG_LV_MEMCPY_MEMSET_STD=y
+# Make lv_coord_t 32-bit. With it off, the usable coord range is only +/-8191 (top 3 bits are type
+# tags), and lv_txt_get_size's overflow guard only trips at 32767 — so a tall chat column (flex of up
+# to MAX_BUBBLES bubbles) can silently cross 8191 and corrupt scroll/clip math (blank/garbled scroll).
+CONFIG_LV_USE_LARGE_COORD=y
 CONFIG_LV_USE_PERF_MONITOR=n
 CONFIG_LV_ATTRIBUTE_FAST_MEM_USE_IRAM=y
 # Chat UI uses only Montserrat 20 — make it the sole built-in glyph set AND the LVGL default font,
