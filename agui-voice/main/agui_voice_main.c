@@ -142,7 +142,9 @@ static void run_agent_turn(const char *text)
     s_run_error      = false;
     chat_ui_status("Thinking...");
     agui_cfg_t acfg = { .endpoint = url, .auth_bearer = have_tok ? token : NULL, .thread_id = NULL };
-    agui_run(&acfg, text, NULL, NULL, NULL, &s_handlers, NULL);
+    cJSON *device_ctx = device_context_build();    // P5 ambient context (read-only; NULL if nothing yet)
+    agui_run(&acfg, text, device_ctx, NULL, NULL, &s_handlers, NULL);
+    cJSON_Delete(device_ctx);                      // agui_run copied what it needs; cJSON_Delete(NULL) is safe
     if (!s_run_error) chat_ui_status(IDLE_HINT);   // success → idle prompt; on error keep "Error" up
 }
 
@@ -233,6 +235,7 @@ void app_main(void)
         net_portal_stop();
     }
     net_start_auto_reconnect();
+    net_sntp_start();                  // P5: sync wall-clock time for ambient context (local_time)
     ESP_LOGI(TAG, "network + keys ready");
 
     // Bring the mic up now; the Soniox WSS opens only on a PTT press.

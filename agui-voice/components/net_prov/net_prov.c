@@ -10,6 +10,7 @@
 #include "freertos/event_groups.h"
 #include "esp_wifi.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
 #include "esp_event.h"
 #include "esp_timer.h"
 #include "esp_log.h"
@@ -208,4 +209,16 @@ void net_low_latency(bool on)
 {
     // Idempotent; safe to call repeatedly. esp_wifi_set_ps applies at runtime once WiFi is started.
     esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
+}
+
+void net_sntp_start(void)
+{
+    // One-shot SNTP for wall-clock time (P5 ambient context "local_time"). Call once after WiFi is
+    // up; it syncs in the background. Guarded so a later reconnect doesn't re-init the service.
+    static bool started;
+    if (started) return;
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    esp_err_t e = esp_netif_sntp_init(&cfg);
+    if (e == ESP_OK) { started = true; ESP_LOGI(TAG, "SNTP started (pool.ntp.org)"); }
+    else ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(e));
 }

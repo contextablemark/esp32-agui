@@ -30,6 +30,10 @@ bool net_get_ip_str(char *buf, size_t len);
 // Start auto-reconnect with backoff for mid-session drops.
 void net_start_auto_reconnect(void);
 
+// Start SNTP (one-shot) so the system clock holds real wall-clock time for ambient context.
+// Call once after WiFi is up; it syncs in the background.
+void net_sntp_start(void);
+
 // Toggle WiFi modem-sleep. true = WIFI_PS_NONE (low latency, higher power) for the duration of a
 // turn (mic streaming + agent reply); false = WIFI_PS_MIN_MODEM (default, power-saving) when idle.
 // Default modem-sleep adds ~100ms/round-trip which throttles the Soniox upload — see soniox_client.
