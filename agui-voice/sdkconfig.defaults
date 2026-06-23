@@ -19,16 +19,17 @@ CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
 # of them with no per-agent cipher juggling.
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_3=y
 CONFIG_MBEDTLS_SSL_TLS1_3_KEXM_EPHEMERAL=y
-# Internal-RAM relief for the TLS path. The C++ rearchitecture (agui_sdk + nlohmann + exception/RTTI
-# tables) added ~30 KB of static internal .bss/.data, which starved the Soniox WSS send path: the TLS
-# handshake succeeded but lwIP then couldn't get internal send buffers, so esp_transport writes
-# stalled (transport_poll_write==0) and never recovered. DYNAMIC_BUFFER makes mbedTLS allocate its
-# 16 KB RX / 4 KB TX content buffers on demand and FREE them between records (instead of pinning them
-# for the whole connection), freeing ~16 KB of internal RAM whenever the link is idle between records
-# — which is most of the time while streaming mic audio. (The CA-cert/config-data free sub-options
-# are deliberately left off: they require re-registering the CA on every reconnect, and the Soniox
-# client reconnects often.)
-CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+# Put mbedTLS buffers in PSRAM. The C++ rearchitecture (agui_sdk + nlohmann + exception/RTTI tables)
+# added ~30 KB of static internal .bss/.data and fragmented the internal heap: the largest free
+# INTERNAL block fell to ~15 KB — below the contiguous ~16.7 KB mbedTLS needs for one TLS RX content
+# buffer. It first showed as lwIP send stalls (E transport_ws: transport_poll_write(0)), then as
+# outright handshake alloc failures ("Dynamic Impl: alloc(16725) failed" → mbedtls_ssl_handshake
+# -0x7F00). EXTERNAL_MEM_ALLOC routes ALL mbedTLS allocations (the Soniox WSS *and* the AG-UI HTTPS
+# runs) to PSRAM, which has megabytes of contiguous space — removing the internal contiguous-block
+# bottleneck entirely. SSL_IN_CONTENT_LEN stays at the 16 KB default (safe for any server cert chain)
+# since it no longer costs internal RAM. (mbedTLS buffers are CPU-accessed, not DMA, so PSRAM is fine;
+# the WiFi driver keeps its own internal DMA buffers.)
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
 # The vendored AG-UI C++ SDK (component agui_sdk) + nlohmann/json throw exceptions, and the SDK's
 # event dispatch (subscriber.cpp / event_verifier.cpp) uses dynamic_cast — so the C++ runtime needs
 # both exceptions and RTTI. The extern "C" shim (agui_client.cpp) catches everything at the C
