@@ -137,6 +137,16 @@ bool device_power_key_short_press(void)
     return (sts & AXP_IRQ_PKEY_SHORT) != 0;
 }
 
+// True if running on battery (no USB/VBUS power) — gates idle WiFi-off so a plugged-in device stays
+// connected + instant. Conservative: if the PMIC can't be read, report NOT on battery (don't shed WiFi).
+bool device_tools_on_battery(void)
+{
+    if (!axp_ensure()) return false;
+    uint8_t s1;
+    if (axp_rd(AXP_REG_STATUS1, &s1) != ESP_OK) return false;
+    return !(s1 & AXP_ST1_VBUS_GOOD);                // VBUS absent → on battery
+}
+
 cJSON *device_context_build(void)
 {
     cJSON *arr = cJSON_CreateArray();

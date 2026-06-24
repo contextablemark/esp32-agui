@@ -229,6 +229,27 @@ void net_low_latency(bool on)
     esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
 }
 
+// Idle low-power: power the WiFi radio fully OFF when idle (display off, on battery), and bring it back
+// on wake. Saves the modem-sleep idle draw entirely; the next turn waits for net_is_connected() first.
+void net_wifi_suspend(void)
+{
+    s_auto = false;                       // stop the disconnect handler from auto-reconnecting
+    if (s_reconnect_timer) esp_timer_stop(s_reconnect_timer);
+    esp_wifi_disconnect();
+    esp_wifi_stop();                      // radio off (~0 mA)
+    s_online = false;
+    ESP_LOGI(TAG, "wifi suspended (radio off)");
+}
+
+void net_wifi_resume(void)
+{
+    s_backoff_ms = BACKOFF_MIN_MS;
+    if (esp_wifi_start() == ESP_OK) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // radio on; restore idle PS
+    s_auto = true;
+    esp_wifi_connect();                   // re-associate (async; net_is_connected() flips true on GOT_IP)
+    ESP_LOGI(TAG, "wifi resuming (reconnecting)");
+}
+
 static volatile bool s_time_synced;   // true once the clock holds real time (SNTP or HTTP fallback)
 
 static void on_sntp_sync(struct timeval *tv)

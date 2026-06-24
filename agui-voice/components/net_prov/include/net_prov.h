@@ -46,6 +46,12 @@ esp_err_t net_time_http_fallback(void);
 // Default modem-sleep adds ~100ms/round-trip which throttles the Soniox upload — see soniox_client.
 void net_low_latency(bool on);
 
+// Idle low-power: net_wifi_suspend() powers the WiFi radio fully off (disconnect + stop, auto-reconnect
+// disabled); net_wifi_resume() powers it back on and re-associates (async — poll net_is_connected()).
+// Used to shed WiFi when idle (display off + on battery). Resume is only valid after a suspend.
+void net_wifi_suspend(void);
+void net_wifi_resume(void);
+
 // NVS credential list management.
 esp_err_t net_creds_add(const char *ssid, const char *pass);
 esp_err_t net_creds_clear(void);

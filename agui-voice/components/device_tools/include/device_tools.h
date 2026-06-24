@@ -27,6 +27,9 @@ cJSON *device_tools_manifest(void);  // JSON-schema list for RunAgentInput.tools
 // Used by the chat_ui screen-power saver to wake the display. False if the AXP2101 is unavailable.
 bool device_power_key_short_press(void);
 
+// True if running on battery (no USB/VBUS power). Gates idle WiFi-off (plugged-in stays connected).
+bool device_tools_on_battery(void);
+
 // A tool implementation: parse args, produce a result JSON (caller owns *result).
 typedef esp_err_t (*device_tool_fn)(const cJSON *args, cJSON **result);
 

@@ -301,6 +301,36 @@ static void play_beep(const int16_t *pcm)
 
 static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
 
+// --- Idle low-power: shed WiFi when the display is off AND on battery ------------------------------
+// Driven by the display-state hook (chat_ui_set_power_cb): the screen-power saver blanks the display
+// on battery -> WiFi radio off; on wake -> WiFi back. Plugged-in stays connected + instant. The
+// set_timer still fires + rings from this state (no WiFi). A PTT press also wakes WiFi (lp_wake) and
+// then waits for the link before opening Soniox. lp_wake runs from two tasks, so it is guarded.
+static volatile bool s_lp_suspended;
+static portMUX_TYPE  s_lp_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void lp_wake(void)   // bring WiFi back if it was shed; exactly-once (screen task OR ptt task)
+{
+    bool go = false;
+    portENTER_CRITICAL(&s_lp_mux);
+    if (s_lp_suspended) { s_lp_suspended = false; go = true; }
+    portEXIT_CRITICAL(&s_lp_mux);
+    if (go) net_wifi_resume();
+}
+
+static void lp_idle(void)   // shed WiFi when idle — only on battery (plugged-in stays connected)
+{
+    if (s_lp_suspended || !device_tools_on_battery()) return;   // I2C read kept outside the critical section
+    s_lp_suspended = true;
+    net_wifi_suspend();
+}
+
+static void lp_set(bool display_on)   // chat_ui display-state hook (runs on the screen-power task)
+{
+    if (display_on) lp_wake();
+    else            lp_idle();
+}
+
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
 static void ptt_task(void *arg)
 {
@@ -312,6 +342,17 @@ static void ptt_task(void *arg)
             s_ptt_final[0] = '\0';
             s_ptt_run[0]   = '\0';
             s_listening = true;
+            lp_wake();                                 // woke from WiFi-off idle? bring the radio back…
+            if (!net_is_connected()) {                 // …and wait for the link before streaming to Soniox
+                chat_ui_status("Connecting...");
+                for (int i = 0; i < 100 && !net_is_connected(); i++) vTaskDelay(pdMS_TO_TICKS(50)); // ~5s
+            }
+            if (!net_is_connected()) {                 // gave up → don't open a doomed session
+                s_listening = false;
+                chat_ui_status("No WiFi");
+                ESP_LOGW(TAG, "wake: WiFi did not reconnect");
+                continue;
+            }
             net_low_latency(true);                     // low-latency WiFi for the whole turn (mic + reply)
             chat_ui_status("Listening...");
             play_ptt_beep();                           // "go ahead" cue; plays & returns before capture starts
@@ -479,6 +520,7 @@ void app_main(void)
     xTaskCreate(timer_alert_task, "tmralert", 4096, NULL, 3, NULL);   // P7: surface set_timer firings
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
+    chat_ui_set_power_cb(lp_set);       // low-power: shed WiFi when the display blanks (on battery), restore on wake
     chat_ui_screen_power_start(60);    // power saver: blank the AMOLED after 60s idle; wake on touch / PWR key / activity
     ESP_LOGI(TAG, "ready — hold BOOT (GPIO0) to talk");
 
