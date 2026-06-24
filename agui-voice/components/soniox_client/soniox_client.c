@@ -34,6 +34,7 @@ static const char *TAG = "soniox";
 #define MSG_MAX          32768         // reject pathologically large server messages
 
 static esp_codec_dev_handle_t        s_mic;
+static bool                          s_mic_open;   // s_mic codec dev currently opened (idle stop/start)
 static esp_websocket_client_handle_t s_ws;
 static SemaphoreHandle_t             s_lock;       // serializes start/finalize/stop
 static SemaphoreHandle_t             s_cap_done;   // capture task signals exit
@@ -271,7 +272,29 @@ esp_err_t soniox_client_init(void)
     };
     esp_err_t err = esp_codec_dev_open(s_mic, &fs);
     if (err != ESP_OK) { ESP_LOGE(TAG, "mic open failed: %s", esp_err_to_name(err)); return err; }
+    s_mic_open = true;
     ESP_LOGI(TAG, "mic ready (16k mono)");
+    return ESP_OK;
+}
+
+// Idle low-power: stop the mic codec when idle so the I2S RX channel is disabled and releases its
+// NO_LIGHT_SLEEP lock (a running I2S blocks light sleep). esp_codec_dev_close() disables the channel;
+// mic_start() reopens it (re-asserting the 30 dB gain) before a turn. Both idempotent.
+esp_err_t soniox_client_mic_stop(void)
+{
+    if (s_mic && s_mic_open) { esp_codec_dev_close(s_mic); s_mic_open = false; }
+    return ESP_OK;
+}
+
+esp_err_t soniox_client_mic_start(void)
+{
+    if (!s_mic) return soniox_client_init();        // first-time init opens it
+    if (s_mic_open) return ESP_OK;
+    esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = DEFAULT_SR };
+    esp_err_t err = esp_codec_dev_open(s_mic, &fs);
+    if (err != ESP_OK) { ESP_LOGE(TAG, "mic reopen failed: %s", esp_err_to_name(err)); return err; }
+    esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
+    s_mic_open = true;
     return ESP_OK;
 }
 

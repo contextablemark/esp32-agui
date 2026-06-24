@@ -77,9 +77,14 @@ CONFIG_LV_USE_DEMO_BENCHMARK=n
 CONFIG_LV_USE_DEMO_STRESS=n
 CONFIG_LV_USE_DEMO_MUSIC=n
 
-# Automatic light sleep (CONFIG_PM_ENABLE) was TRIED and REVERTED: on this internal-RAM-tight build it
-# caused intermittent "STT failed to start" — light sleep with associated WiFi churns the internal heap
-# across sleep/wake cycles, and the Soniox WSS/TLS couldn't get a contiguous block (failed even at
-# internal_max ~15 KB). CPU-idle savings aren't worth breaking STT. Low power is instead pursued via
-# WiFi-off-when-display-off (no PM, RAM-neutral). Leaving PM off.
-# CONFIG_PM_ENABLE is not set
+# Idle low-power step 3: automatic light sleep + DFS. SAFE this time because light sleep engages ONLY
+# when idle on battery, where WiFi AND the codec/I2S are powered OFF (lp_idle in main releases the
+# NO_LIGHT_SLEEP lock only after both are down). That removes BOTH failure sources: the associated-WiFi
+# heap churn (earlier "STT failed to start") AND the I2S NO_LIGHT_SLEEP lock that otherwise blocks sleep.
+# IRAM sleep opts stay OFF (they cost ~27 KB internal); CPU stays clock-gated (power-down off).
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+# CONFIG_PM_SLP_IRAM_OPT is not set
+# CONFIG_ESP_WIFI_SLP_IRAM_OPT is not set
+# CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP is not set
+# CONFIG_ESP_SYSTEM_PM_POWER_DOWN_CPU is not set

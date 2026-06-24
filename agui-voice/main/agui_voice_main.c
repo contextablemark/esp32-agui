@@ -20,6 +20,7 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
+#include "esp_pm.h"
 #include "nvs_flash.h"
 #include "iot_button.h"
 #include "button_gpio.h"
@@ -301,34 +302,63 @@ static void play_beep(const int16_t *pcm)
 
 static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
 
-// --- Idle low-power: shed WiFi when the display is off AND on battery ------------------------------
-// Driven by the display-state hook (chat_ui_set_power_cb): the screen-power saver blanks the display
-// on battery -> WiFi radio off; on wake -> WiFi back. Plugged-in stays connected + instant. The
-// set_timer still fires + rings from this state (no WiFi). A PTT press also wakes WiFi (lp_wake) and
-// then waits for the link before opening Soniox. lp_wake runs from two tasks, so it is guarded.
-static volatile bool s_lp_suspended;
-static portMUX_TYPE  s_lp_mux = portMUX_INITIALIZER_UNLOCKED;
+// --- Idle low-power: when the display is off AND on battery, shed WiFi + the codec/I2S and let the
+// CPU light-sleep --------------------------------------------------------------------------------
+// Driven by the chat_ui display-state hook. On battery-idle we (a) stop WiFi (radio off), (b) stop the
+// mic + speaker codec so the I2S releases its NO_LIGHT_SLEEP lock (a running I2S blocks light sleep),
+// and (c) release our own NO_LIGHT_SLEEP lock — so the CPU light-sleeps ONLY when WiFi+codec are both
+// off, which is exactly battery-idle (never with WiFi associated → no heap churn → STT stays safe).
+// On wake we reverse it. Plugged-in stays fully on. The set_timer still fires + rings (esp_timer wakes
+// the CPU; the alarm reopens the speaker lazily via play_beep, no WiFi). A PTT press wakes everything
+// then waits for the link. lp_idle/lp_wake are serialized by a mutex (called from screen + ptt tasks).
+static volatile bool        s_lp_suspended;
+static SemaphoreHandle_t    s_lp_mutex;
+static esp_pm_lock_handle_t s_lp_lock;     // NO_LIGHT_SLEEP — HELD while active, released only when idle
 
-static void lp_wake(void)   // bring WiFi back if it was shed; exactly-once (screen task OR ptt task)
+static void lp_wake(void)   // bring WiFi + codec back if shed; exactly-once
 {
-    bool go = false;
-    portENTER_CRITICAL(&s_lp_mux);
-    if (s_lp_suspended) { s_lp_suspended = false; go = true; }
-    portEXIT_CRITICAL(&s_lp_mux);
-    if (go) net_wifi_resume();
+    if (!s_lp_mutex) return;
+    xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
+    if (s_lp_suspended) {
+        s_lp_suspended = false;
+        if (s_lp_lock) esp_pm_lock_acquire(s_lp_lock);   // no light sleep while active
+        soniox_client_mic_start();                       // re-enable the mic I2S (+ gain) for the turn
+        net_wifi_resume();
+    }
+    xSemaphoreGive(s_lp_mutex);
 }
 
-static void lp_idle(void)   // shed WiFi when idle — only on battery (plugged-in stays connected)
+static void lp_idle(void)   // shed everything when idle — only on battery (plugged-in stays connected)
 {
-    if (s_lp_suspended || !device_tools_on_battery()) return;   // I2C read kept outside the critical section
-    s_lp_suspended = true;
-    net_wifi_suspend();
+    if (!s_lp_mutex || s_lp_suspended || !device_tools_on_battery()) return;   // I2C read outside the mutex
+    xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
+    if (!s_lp_suspended) {
+        s_lp_suspended = true;
+        soniox_client_mic_stop();                                // disable the mic I2S (RX)
+        if (s_spk) { esp_codec_dev_close(s_spk); s_spk = NULL; } // disable the speaker I2S (TX); reopens on next beep
+        net_wifi_suspend();
+        if (s_lp_lock) esp_pm_lock_release(s_lp_lock);           // WiFi+I2S now off → allow light sleep
+    }
+    xSemaphoreGive(s_lp_mutex);
 }
 
 static void lp_set(bool display_on)   // chat_ui display-state hook (runs on the screen-power task)
 {
     if (display_on) lp_wake();
     else            lp_idle();
+}
+
+// Configure PM for automatic light sleep + DFS, and take the NO_LIGHT_SLEEP lock (active at boot).
+// lp_idle releases it once WiFi+codec are off; lp_wake re-takes it. If PM isn't compiled in, the WiFi/
+// codec shedding still works (the lock is just NULL) — no light sleep, but no crash.
+static void power_mgmt_start(void)
+{
+    s_lp_mutex = xSemaphoreCreateMutex();
+    esp_pm_config_t pmc = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = true };
+    if (esp_pm_configure(&pmc) != ESP_OK) { ESP_LOGW(TAG, "PM configure failed (CONFIG_PM_ENABLE?)"); return; }
+    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "active", &s_lp_lock) != ESP_OK) return;
+    esp_pm_lock_acquire(s_lp_lock);   // active at boot → no light sleep until lp_idle releases it
+    ESP_LOGI(TAG, "PM: light sleep when idle (WiFi + codec off, on battery)");
 }
 
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
@@ -511,6 +541,8 @@ void app_main(void)
 
     // Bring the mic up now; the Soniox WSS opens only on a PTT press.
     if (soniox_client_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");
+
+    power_mgmt_start();   // low-power: light sleep when idle (creates the lp mutex before ptt_task uses it)
 
     // P3: BOOT-button push-to-talk.
     s_ptt_q = xQueueCreate(4, sizeof(int));
