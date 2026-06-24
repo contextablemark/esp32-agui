@@ -19,6 +19,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "iot_button.h"
 #include "button_gpio.h"
@@ -357,19 +358,62 @@ static esp_err_t ptt_button_init(void)
     return ESP_OK;
 }
 
-// Poll the device timer (~1s): when a set_timer elapses, surface it on-screen and chime. The tool
-// itself can't touch the UI (device_tools must not depend on chat_ui), so the alert lives here.
+// A firing timer RINGS until the screen is tapped: bursts of 4 quick beeps with the AMOLED flashing
+// on/off in sync, then a dark pause, repeating. Runs on the timer task. chat_ui_alarm_set() suspends
+// the idle power-saver so it doesn't fight the flashing; we poll chat_ui_touch_idle_ms() for the
+// dismiss tap (object-independent, so a tap anywhere — even on a chat bubble — counts). Auto-stops
+// after ALARM_MAX_MS, or if BOOT is held to start a turn (s_listening).
+#define ALARM_BRIGHT     90
+#define ALARM_BEEPS      4
+#define ALARM_GAP_MS     70
+#define ALARM_PAUSE_MS   900
+#define ALARM_MAX_MS     120000
+
+// True once a fresh dismiss tap is seen — but only after the screen has first gone quiet, so a tap
+// just before the timer fired doesn't instantly dismiss it. `*armed` persists across calls.
+static bool alarm_dismiss_tap(bool *armed)
+{
+    uint32_t ti = chat_ui_touch_idle_ms();
+    if (ti > 600) *armed = true;            // quiet (finger up / no recent touch) → ready to accept a tap
+    return *armed && ti < 250;              // a touch within the last 250ms
+}
+
+static void run_timer_alarm(const char *label)
+{
+    char msg[72];
+    snprintf(msg, sizeof msg, "Timer done%s%s  (tap to dismiss)", label[0] ? ": " : "", label);
+    chat_ui_note_activity();
+    chat_ui_status(msg);
+    chat_ui_alarm_set(true);                 // we own the screen now; suspend the idle saver
+
+    int64_t start = esp_timer_get_time();
+    bool armed = false, done = false;
+    while (!done && !s_listening && (esp_timer_get_time() - start) < (int64_t)ALARM_MAX_MS * 1000) {
+        for (int i = 0; i < ALARM_BEEPS && !done; i++) {
+            bsp_display_brightness_set(ALARM_BRIGHT);   // flash ON with the beep…
+            play_ptt_beep();                            // ~90ms tone (blocks)
+            bsp_display_brightness_set(0);              // …and OFF between
+            vTaskDelay(pdMS_TO_TICKS(ALARM_GAP_MS));
+            if (alarm_dismiss_tap(&armed) || s_listening) done = true;
+        }
+        for (int t = 0; t < ALARM_PAUSE_MS && !done; t += 50) {   // dark pause, polling for the tap
+            vTaskDelay(pdMS_TO_TICKS(50));
+            if (alarm_dismiss_tap(&armed) || s_listening) done = true;
+        }
+    }
+    chat_ui_alarm_set(false);                // resume the saver; screen stays on
+    bsp_display_brightness_set(ALARM_BRIGHT);
+    chat_ui_status(IDLE_HINT);
+}
+
+// Poll the device timer (~1s): when a set_timer elapses, ring the alarm until the screen is tapped.
 static void timer_alert_task(void *arg)
 {
     char label[40];
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(1000));
-        if (!device_tools_timer_take_fired(label, sizeof label)) continue;
-        chat_ui_note_activity();                       // wake the screen for the alert
-        char msg[64];
-        snprintf(msg, sizeof msg, "Timer done%s%s", label[0] ? ": " : "", label);
-        chat_ui_status(msg);
-        if (!s_listening) play_ptt_beep();             // chime, unless a PTT turn owns the speaker
+        if (device_tools_timer_take_fired(label, sizeof label))
+            run_timer_alarm(label);
     }
 }
 

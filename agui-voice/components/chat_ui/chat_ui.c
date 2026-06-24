@@ -277,8 +277,26 @@ static uint32_t          s_idle_timeout_ms = SCREEN_IDLE_TIMEOUT_MS;
 static bool              s_screen_on = true;
 static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
 static uint32_t          s_force_off_ms;                // when the force-off press happened
+static volatile bool     s_alarm_active;                // a timer is ringing → it owns the screen
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
+
+void chat_ui_alarm_set(bool on)
+{
+    s_alarm_active = on;
+    if (!on) {                          // alarm ended (tap/timeout): screen is on, resync the saver
+        s_screen_on = true;
+        s_force_off_armed = false;
+        chat_ui_note_activity();
+    }
+}
+
+uint32_t chat_ui_touch_idle_ms(void)
+{
+    uint32_t ti = UINT32_MAX;
+    if (bsp_display_lock(50)) { ti = lv_disp_get_inactive_time(NULL); bsp_display_unlock(); }
+    return ti;
+}
 
 static void screen_power_task(void *arg)
 {
@@ -290,7 +308,10 @@ static void screen_power_task(void *arg)
         // off immediately, without waiting out the idle timeout. A forced-off screen stays off until
         // activity *newer* than the press arrives (touch / PWR tap / UI) — so the press itself, and
         // any touch just before it, don't re-wake it.
-        if (device_power_key_short_press()) {
+        bool pwr = device_power_key_short_press();   // always consume so the latch can't fire post-alarm
+        if (s_alarm_active) continue;                // a ringing timer owns the screen (brightness flash +
+                                                     // tap-to-dismiss run in timer_alert_task); skip idle/PWR
+        if (pwr) {
             if (s_screen_on) { s_force_off_armed = true; s_force_off_ms = now_ms(); }
             else             { s_force_off_armed = false; chat_ui_note_activity(); }
         }

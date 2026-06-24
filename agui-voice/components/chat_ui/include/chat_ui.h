@@ -7,6 +7,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <stdbool.h>
 #include "esp_err.h"
 #include "cJSON.h"
 
@@ -35,6 +36,14 @@ void  chat_ui_screen_power_start(int idle_timeout_s);
 // Mark user/agent activity so the screen-power saver keeps the display awake. The UI mutators call
 // this internally; call it too from external input sources (e.g. button presses).
 void  chat_ui_note_activity(void);
+
+// Alarm mode: while a timer is ringing, the timer task owns the screen (brightness flash). Setting
+// this suspends the idle power-saver so it doesn't fight the flashing; pass false to resume (the saver
+// treats the screen as on + active). Lets an alert flash the panel without the saver blanking it.
+void     chat_ui_alarm_set(bool on);
+// ms since the last touch (LVGL input inactivity — object-independent, so a tap anywhere counts),
+// or UINT32_MAX if the LVGL lock is momentarily busy. Used to detect a tap-to-dismiss during an alarm.
+uint32_t chat_ui_touch_idle_ms(void);
 
 // Interrupt prompt: build widgets from response_schema; answer returned via callback.
 typedef void (*chat_ui_answer_cb)(const cJSON *answer, void *ctx);
