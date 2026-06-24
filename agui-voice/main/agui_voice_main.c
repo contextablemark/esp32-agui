@@ -239,42 +239,52 @@ static void run_agent_turn(const char *text)
 // speaker soft-resets the shared chip (clobbers the mic ADC gain) and its acoustic crosstalk lands
 // in the live RX DMA ring — capture_task compensates by re-asserting the mic gain and draining the
 // ring before it forwards any audio (see soniox_client capture_task).
-#define BEEP_SR      16000   // MUST equal soniox_client DEFAULT_SR (the mic rate)
-#define BEEP_FREQ    950     // Hz — subtle mid/high, clear over a small speaker
-#define BEEP_MS      90      // duration
-#define BEEP_FADE_MS 6       // linear fade in AND out — kills edge clicks
-#define BEEP_AMPL    6000    // int16 peak (~0.18 FS): audible with ~5x headroom, cannot clip
-#define BEEP_VOL     75      // esp_codec_dev out-vol INDEX 0-100 (NOT dB; 0 would be -96 dB = silent)
-#define BEEP_SAMPLES (BEEP_SR * BEEP_MS / 1000)        // 1440
-#define BEEP_FADE_N  (BEEP_SR * BEEP_FADE_MS / 1000)   // 96
+#define BEEP_SR        16000   // MUST equal soniox_client DEFAULT_SR (the mic rate)
+#define BEEP_MS        90      // duration of one beep
+#define BEEP_FADE_MS   6       // linear fade in AND out — kills edge clicks
+#define BEEP_VOL       75      // esp_codec_dev out-vol INDEX 0-100 (NOT dB; 0 would be -96 dB = silent).
+                               // Shared by both tones at a known-good analog gain; loudness is set by the
+                               // digital amplitude below, so neither tone overdrives the PA.
+// Two tones share the speaker: a SUBTLE PTT "go ahead" cue and a LOUDER, higher-pitched timer alarm.
+// Loudness ≈ amplitude / 32767 of full scale (clean headroom — alarm can go toward ~30000 for more).
+#define CUE_FREQ       950     // Hz — subtle mid tone for the PTT cue
+#define CUE_AMPL       6000    // ~0.18 FS — subtle (unchanged)
+#define ALARM_FREQ     1760    // Hz — higher pitched, more attention-getting
+#define ALARM_AMPL     20000   // ~0.61 FS — ~+10 dB louder than the cue, still clean
+#define BEEP_SAMPLES   (BEEP_SR * BEEP_MS / 1000)        // 1440
+#define BEEP_FADE_N    (BEEP_SR * BEEP_FADE_MS / 1000)   // 96
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
 static esp_codec_dev_handle_t s_spk;              // speaker OUT handle, opened once and kept open
-static int16_t s_beep_pcm[BEEP_SAMPLES];          // precomputed once (~2.8 KB)
+static int16_t s_cue_pcm[BEEP_SAMPLES];           // PTT cue (subtle)
+static int16_t s_alarm_pcm[BEEP_SAMPLES];         // timer alarm (loud, higher)
 static bool    s_beep_ready;
 
-// Fill s_beep_pcm with a BEEP_FREQ sine at 16k mono, with linear fade-in/out on the edges so the
-// buffer's start/end discontinuities don't click. Peak ±BEEP_AMPL ≈ 0.18 FS → mathematically can't clip.
-static void beep_pcm_build(void)
+// Fill `buf` with a `freq` sine at 16k mono, linear fade-in/out on the edges so the buffer's
+// start/end discontinuities don't click. Peak ±ampl; keep ampl < 32767 so it can't digitally clip.
+static void fill_tone(int16_t *buf, int freq, int ampl)
 {
-    const double w = 2.0 * M_PI * (double)BEEP_FREQ / (double)BEEP_SR;
+    const double w = 2.0 * M_PI * (double)freq / (double)BEEP_SR;
     for (int i = 0; i < BEEP_SAMPLES; i++) {
         double env = 1.0;                                            // anti-click amplitude envelope
         if (i < BEEP_FADE_N)                       env = (double)i / BEEP_FADE_N;
         else if (i >= BEEP_SAMPLES - BEEP_FADE_N)  env = (double)(BEEP_SAMPLES - 1 - i) / BEEP_FADE_N;
-        s_beep_pcm[i] = (int16_t)lrint(sin(w * i) * env * BEEP_AMPL);
+        buf[i] = (int16_t)lrint(sin(w * i) * env * ampl);
     }
-    s_beep_ready = true;
 }
 
-// Lazily bring up the speaker (once) and play the cue. Blocks (~90 ms) until the tone is clocked out
-// of the I2S TX DMA, so capture then starts on silence. Call ONLY from ptt_task, never a button cb.
-static void play_ptt_beep(void)
+// Lazily bring up the speaker (once) and play one precomputed tone. Blocks (~90 ms) until it is
+// clocked out of the I2S TX DMA. Call ONLY from a task (ptt_task / timer task), never a button cb.
+static void play_beep(const int16_t *pcm)
 {
-    if (!s_beep_ready) beep_pcm_build();
+    if (!s_beep_ready) {
+        fill_tone(s_cue_pcm,   CUE_FREQ,   CUE_AMPL);
+        fill_tone(s_alarm_pcm, ALARM_FREQ, ALARM_AMPL);
+        s_beep_ready = true;
+    }
     if (!s_spk) {
         s_spk = bsp_audio_codec_speaker_init();                 // pa_pin = GPIO46, raised automatically
         if (!s_spk) { ESP_LOGW(TAG, "beep: speaker init failed"); return; }
@@ -282,13 +292,15 @@ static void play_ptt_beep(void)
         esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = BEEP_SR };
         if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) {         // same 16k as the mic → full-duplex OK
             ESP_LOGW(TAG, "beep: speaker open failed");
-            s_spk = NULL;                                       // retry on the next press
+            s_spk = NULL;                                       // retry on the next call
             return;
         }
         ESP_LOGI(TAG, "beep: speaker ready (16k mono)");
     }
-    esp_codec_dev_write(s_spk, s_beep_pcm, sizeof s_beep_pcm);
+    esp_codec_dev_write(s_spk, (int16_t *)pcm, BEEP_SAMPLES * sizeof(int16_t));   // API wants non-const
 }
+
+static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
 
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
 static void ptt_task(void *arg)
@@ -365,7 +377,7 @@ static esp_err_t ptt_button_init(void)
 // after ALARM_MAX_MS, or if BOOT is held to start a turn (s_listening).
 #define ALARM_BRIGHT     90
 #define ALARM_BEEPS      4
-#define ALARM_GAP_MS     70
+#define ALARM_GAP_MS     150
 #define ALARM_PAUSE_MS   900
 #define ALARM_MAX_MS     120000
 
@@ -391,7 +403,7 @@ static void run_timer_alarm(const char *label)
     while (!done && !s_listening && (esp_timer_get_time() - start) < (int64_t)ALARM_MAX_MS * 1000) {
         for (int i = 0; i < ALARM_BEEPS && !done; i++) {
             bsp_display_brightness_set(ALARM_BRIGHT);   // flash ON with the beep…
-            play_ptt_beep();                            // ~90ms tone (blocks)
+            play_beep(s_alarm_pcm);                     // ~90ms loud, higher alarm tone (blocks)
             bsp_display_brightness_set(0);              // …and OFF between
             vTaskDelay(pdMS_TO_TICKS(ALARM_GAP_MS));
             if (alarm_dismiss_tap(&armed) || s_listening) done = true;
