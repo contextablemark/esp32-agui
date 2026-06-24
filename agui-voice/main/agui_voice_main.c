@@ -20,7 +20,6 @@
 #include "esp_system.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
-#include "esp_pm.h"
 #include "nvs_flash.h"
 #include "iot_button.h"
 #include "button_gpio.h"
@@ -442,32 +441,6 @@ static void timer_alert_task(void *arg)
     }
 }
 
-// --- Idle low-power: automatic light sleep + DFS, gated on the display being OFF ------------------
-// PM is configured for automatic light sleep + DFS (80-240 MHz). We hold a NO_LIGHT_SLEEP lock while
-// the display is ON (full responsiveness during use) and release it when the screen-power saver blanks
-// the display — so the CPU only light-sleeps when idle. The (event-driven) set_timer still wakes the
-// CPU at its deadline, and the BOOT button still wakes it for a turn.
-static esp_pm_lock_handle_t s_disp_on_lock;
-static bool                 s_disp_on_held;
-
-static void power_cb(bool display_on)   // from chat_ui's screen-power task, on each on/off transition
-{
-    if (!s_disp_on_lock) return;
-    if (display_on && !s_disp_on_held)      { esp_pm_lock_acquire(s_disp_on_lock); s_disp_on_held = true; }
-    else if (!display_on && s_disp_on_held) { esp_pm_lock_release(s_disp_on_lock); s_disp_on_held = false;
-                                              ESP_LOGI(TAG, "display off -> light sleep enabled"); }
-}
-
-static void power_mgmt_start(void)
-{
-    esp_pm_config_t pmc = { .max_freq_mhz = 240, .min_freq_mhz = 80, .light_sleep_enable = true };
-    if (esp_pm_configure(&pmc) != ESP_OK) { ESP_LOGW(TAG, "PM configure failed (CONFIG_PM_ENABLE?)"); return; }
-    if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "disp_on", &s_disp_on_lock) != ESP_OK) return;
-    esp_pm_lock_acquire(s_disp_on_lock); s_disp_on_held = true;   // display starts on -> hold full power
-    chat_ui_set_power_cb(power_cb);
-    ESP_LOGI(TAG, "PM: DFS 80-240MHz + light-sleep-when-display-off");
-}
-
 void app_main(void)
 {
     ESP_LOGI(TAG, "AG-UI voice client booting (P0-P3)");
@@ -506,7 +479,6 @@ void app_main(void)
     xTaskCreate(timer_alert_task, "tmralert", 4096, NULL, 3, NULL);   // P7: surface set_timer firings
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
-    power_mgmt_start();                 // low-power: light sleep + DFS, gated on display-off (must precede the saver)
     chat_ui_screen_power_start(60);    // power saver: blank the AMOLED after 60s idle; wake on touch / PWR key / activity
     ESP_LOGI(TAG, "ready — hold BOOT (GPIO0) to talk");
 
