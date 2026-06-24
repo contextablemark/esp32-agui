@@ -76,3 +76,14 @@ CONFIG_LV_USE_DEMO_WIDGETS=n
 CONFIG_LV_USE_DEMO_BENCHMARK=n
 CONFIG_LV_USE_DEMO_STRESS=n
 CONFIG_LV_USE_DEMO_MUSIC=n
+
+# Idle low-power: DFS + automatic light sleep, gated on display-off (see power_mgmt_start in main).
+# Needs tickless idle so the CPU actually sleeps between events; the event-driven set_timer + the BOOT
+# button still wake it. CPU is CLOCK-gated (not power-gated) in light sleep — power-gating the CPU while
+# WiFi stays associated is fragile (cache/MAC restore races); clock-gating keeps wake instant + state intact.
+CONFIG_PM_ENABLE=y
+CONFIG_FREERTOS_USE_TICKLESS_IDLE=y
+CONFIG_PM_SLP_IRAM_OPT=y
+CONFIG_ESP_WIFI_SLP_IRAM_OPT=y
+# CONFIG_PM_POWER_DOWN_CPU_IN_LIGHT_SLEEP is not set
+# CONFIG_ESP_SYSTEM_PM_POWER_DOWN_CPU is not set

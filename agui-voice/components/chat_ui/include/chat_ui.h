@@ -49,6 +49,11 @@ void     chat_ui_alarm_flash(bool on);
 // or UINT32_MAX if the LVGL lock is momentarily busy. Used to detect a tap-to-dismiss during an alarm.
 uint32_t chat_ui_touch_idle_ms(void);
 
+// Power-state hook: called from the screen-power task whenever the display turns on/off. Lets the app
+// gate power management on display state (e.g. allow light sleep only while the display is off).
+typedef void (*chat_ui_power_cb)(bool display_on);
+void     chat_ui_set_power_cb(chat_ui_power_cb cb);
+
 // Interrupt prompt: build widgets from response_schema; answer returned via callback.
 typedef void (*chat_ui_answer_cb)(const cJSON *answer, void *ctx);
 void  chat_ui_prompt(const char *message, const cJSON *response_schema,

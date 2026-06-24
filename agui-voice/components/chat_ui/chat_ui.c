@@ -353,6 +353,10 @@ uint32_t chat_ui_touch_idle_ms(void)
     return ti;
 }
 
+// Power-state hook (gates light sleep on display on/off); notified from screen_power_task.
+static chat_ui_power_cb s_power_cb;
+void chat_ui_set_power_cb(chat_ui_power_cb cb) { s_power_cb = cb; }
+
 static void screen_power_task(void *arg)
 {
     chat_ui_note_activity();
@@ -403,6 +407,7 @@ static void screen_power_task(void *arg)
             bsp_display_brightness_set(want_on ? SCREEN_ON_BRIGHTNESS : 0);
             ESP_LOGI(TAG, "screen %s (idle=%ums%s)", want_on ? "on" : "off",
                      (unsigned)idle, want_on ? "" : (s_force_off_armed ? ", PWR-off" : ""));
+            if (s_power_cb) s_power_cb(want_on);   // gate light sleep on display state
         }
     }
 }
