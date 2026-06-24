@@ -249,8 +249,8 @@ static void run_agent_turn(const char *text)
 // Loudness ≈ amplitude / 32767 of full scale (clean headroom — alarm can go toward ~30000 for more).
 #define CUE_FREQ       950     // Hz — subtle mid tone for the PTT cue
 #define CUE_AMPL       6000    // ~0.18 FS — subtle (unchanged)
-#define ALARM_FREQ     1760    // Hz — higher pitched, more attention-getting
-#define ALARM_AMPL     20000   // ~0.61 FS — ~+10 dB louder than the cue, still clean
+#define ALARM_FREQ     1760    // Hz — higher pitched, more attention-getting (loudness ramps in
+                               // run_timer_alarm via ALARM_LEVELS, so there's no fixed alarm amplitude)
 #define BEEP_SAMPLES   (BEEP_SR * BEEP_MS / 1000)        // 1440
 #define BEEP_FADE_N    (BEEP_SR * BEEP_FADE_MS / 1000)   // 96
 
@@ -280,9 +280,8 @@ static void fill_tone(int16_t *buf, int freq, int ampl)
 // clocked out of the I2S TX DMA. Call ONLY from a task (ptt_task / timer task), never a button cb.
 static void play_beep(const int16_t *pcm)
 {
-    if (!s_beep_ready) {
-        fill_tone(s_cue_pcm,   CUE_FREQ,   CUE_AMPL);
-        fill_tone(s_alarm_pcm, ALARM_FREQ, ALARM_AMPL);
+    if (!s_beep_ready) {                            // build the cue once; run_timer_alarm (re)fills the
+        fill_tone(s_cue_pcm, CUE_FREQ, CUE_AMPL);   // alarm buffer at its current escalation level
         s_beep_ready = true;
     }
     if (!s_spk) {
@@ -370,16 +369,29 @@ static esp_err_t ptt_button_init(void)
     return ESP_OK;
 }
 
-// A firing timer RINGS until the screen is tapped: bursts of 4 quick beeps with the AMOLED flashing
-// on/off in sync, then a dark pause, repeating. Runs on the timer task. chat_ui_alarm_set() suspends
-// the idle power-saver so it doesn't fight the flashing; we poll chat_ui_touch_idle_ms() for the
-// dismiss tap (object-independent, so a tap anywhere — even on a chat bubble — counts). Auto-stops
-// after ALARM_MAX_MS, or if BOOT is held to start a turn (s_listening).
+// A firing timer RINGS until the screen is tapped: bursts of 4 quick beeps with a big red ring
+// flashing on/off in sync, then a dark pause, repeating — and getting LOUDER every few cycles. Runs
+// on the timer task. chat_ui_alarm_set() shows the red-ring overlay + suspends the idle power-saver;
+// we poll chat_ui_touch_idle_ms() for the dismiss tap (object-independent, so a tap anywhere counts).
+// Auto-stops after ALARM_MAX_MS, or if BOOT is held to start a turn (s_listening).
 #define ALARM_BRIGHT     90
 #define ALARM_BEEPS      4
 #define ALARM_GAP_MS     150
 #define ALARM_PAUSE_MS   900
 #define ALARM_MAX_MS     120000
+#define ALARM_CYCLES_PER_LEVEL 4   // beep cycles at each loudness before stepping up
+// Escalating loudness — int16 amplitudes (~/32767 of full scale). Start ~half the comfortable level
+// and step up every ALARM_CYCLES_PER_LEVEL cycles until dismissed; top stays clear of clipping.
+static const int ALARM_LEVELS[] = { 10000, 15000, 21000, 28000 };  // ~0.30, 0.46, 0.64, 0.85 FS
+#define ALARM_NLEVELS ((int)(sizeof ALARM_LEVELS / sizeof ALARM_LEVELS[0]))
+
+// Flash the panel, serialized with LVGL via the display lock — the brightness command (0x51) shares
+// the QSPI io handle with LVGL's flush, so unlocked rapid toggling collides and gets dropped (the
+// panel just stays put). Locking makes the flash reliable.
+static void alarm_screen(bool on)
+{
+    if (bsp_display_lock(100)) { bsp_display_brightness_set(on ? ALARM_BRIGHT : 0); bsp_display_unlock(); }
+}
 
 // True once a fresh dismiss tap is seen — but only after the screen has first gone quiet, so a tap
 // just before the timer fired doesn't instantly dismiss it. `*armed` persists across calls.
@@ -392,19 +404,21 @@ static bool alarm_dismiss_tap(bool *armed)
 
 static void run_timer_alarm(const char *label)
 {
-    char msg[72];
-    snprintf(msg, sizeof msg, "Timer done%s%s  (tap to dismiss)", label[0] ? ": " : "", label);
     chat_ui_note_activity();
-    chat_ui_status(msg);
-    chat_ui_alarm_set(true);                 // we own the screen now; suspend the idle saver
+    chat_ui_alarm_set(true);                 // black overlay + red ring; suspends the idle saver
 
     int64_t start = esp_timer_get_time();
     bool armed = false, done = false;
+    int  cycle = 0, level = -1;
     while (!done && !s_listening && (esp_timer_get_time() - start) < (int64_t)ALARM_MAX_MS * 1000) {
+        int want = cycle / ALARM_CYCLES_PER_LEVEL;            // escalate loudness over cycles
+        if (want >= ALARM_NLEVELS) want = ALARM_NLEVELS - 1;
+        if (want != level) { level = want; fill_tone(s_alarm_pcm, ALARM_FREQ, ALARM_LEVELS[level]); }
+
         for (int i = 0; i < ALARM_BEEPS && !done; i++) {
-            bsp_display_brightness_set(ALARM_BRIGHT);   // flash ON with the beep…
-            play_beep(s_alarm_pcm);                     // ~90ms loud, higher alarm tone (blocks)
-            bsp_display_brightness_set(0);              // …and OFF between
+            alarm_screen(true);                  // red ring ON, in sync with the beep…
+            play_beep(s_alarm_pcm);              // ~90ms (blocks)
+            alarm_screen(false);                 // …and dark between
             vTaskDelay(pdMS_TO_TICKS(ALARM_GAP_MS));
             if (alarm_dismiss_tap(&armed) || s_listening) done = true;
         }
@@ -412,10 +426,13 @@ static void run_timer_alarm(const char *label)
             vTaskDelay(pdMS_TO_TICKS(50));
             if (alarm_dismiss_tap(&armed) || s_listening) done = true;
         }
+        cycle++;
     }
-    chat_ui_alarm_set(false);                // resume the saver; screen stays on
+    chat_ui_alarm_set(false);                // remove overlay; resume saver; screen on
     bsp_display_brightness_set(ALARM_BRIGHT);
-    chat_ui_status(IDLE_HINT);
+    char msg[72];
+    snprintf(msg, sizeof msg, "Timer done%s%s", label[0] ? ": " : "", label);
+    chat_ui_status(msg);
 }
 
 // Poll the device timer (~1s): when a set_timer elapses, ring the alarm until the screen is tapped.

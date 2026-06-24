@@ -278,14 +278,45 @@ static bool              s_screen_on = true;
 static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
 static uint32_t          s_force_off_ms;                // when the force-off press happened
 static volatile bool     s_alarm_active;                // a timer is ringing → it owns the screen
+static lv_obj_t         *s_alarm_overlay;               // full-screen black + red ring shown while ringing
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 
+// Enter/leave alarm mode. On: cover the UI with a black overlay holding a big red ring (outline) in
+// the center, and suspend the idle power-saver so the timer task can flash the panel in time with the
+// beeps. Off: remove the overlay and resume the saver (screen left on). LVGL ops → this locks; called
+// from the timer task, never a handler.
 void chat_ui_alarm_set(bool on)
 {
-    s_alarm_active = on;
-    if (!on) {                          // alarm ended (tap/timeout): screen is on, resync the saver
-        s_screen_on = true;
+    if (on) {
+        if (bsp_display_lock(1000)) {
+            if (!s_alarm_overlay) {
+                s_alarm_overlay = lv_obj_create(lv_scr_act());
+                lv_obj_remove_style_all(s_alarm_overlay);
+                lv_obj_set_size(s_alarm_overlay, lv_pct(100), lv_pct(100));
+                lv_obj_set_style_bg_color(s_alarm_overlay, lv_color_black(), 0);
+                lv_obj_set_style_bg_opa(s_alarm_overlay, LV_OPA_COVER, 0);
+                lv_obj_clear_flag(s_alarm_overlay, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_t *ring = lv_obj_create(s_alarm_overlay);     // outline-only circle (no fill)
+                lv_obj_remove_style_all(ring);
+                lv_obj_set_size(ring, 220, 220);
+                lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+                lv_obj_set_style_border_color(ring, lv_color_hex(0xFF2222), 0);
+                lv_obj_set_style_border_width(ring, 14, 0);
+                lv_obj_center(ring);
+                lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+            }
+            bsp_display_unlock();
+        }
+        s_alarm_active = true;
+    } else {
+        s_alarm_active = false;
+        if (bsp_display_lock(1000)) {
+            if (s_alarm_overlay) { lv_obj_del(s_alarm_overlay); s_alarm_overlay = NULL; }
+            bsp_display_unlock();
+        }
+        s_screen_on = true;             // alarm ended: screen is on, resync the saver
         s_force_off_armed = false;
         chat_ui_note_activity();
     }
