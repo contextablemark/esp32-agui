@@ -382,7 +382,7 @@ static esp_err_t ptt_button_init(void)
 #define ALARM_CYCLES_PER_LEVEL 4   // beep cycles at each loudness before stepping up
 // Escalating loudness — int16 amplitudes (~/32767 of full scale). Start ~half the comfortable level
 // and step up every ALARM_CYCLES_PER_LEVEL cycles until dismissed; top stays clear of clipping.
-static const int ALARM_LEVELS[] = { 10000, 15000, 21000, 28000 };  // ~0.30, 0.46, 0.64, 0.85 FS
+static const int ALARM_LEVELS[] = { 6500, 10000, 15000, 21000, 28000 };  // ~0.20,0.30,0.46,0.64,0.85 FS
 #define ALARM_NLEVELS ((int)(sizeof ALARM_LEVELS / sizeof ALARM_LEVELS[0]))
 
 // Flash the panel, serialized with LVGL via the display lock — the brightness command (0x51) shares
