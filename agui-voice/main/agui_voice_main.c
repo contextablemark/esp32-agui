@@ -431,10 +431,12 @@ static void run_timer_alarm(const char *label)
 // Poll the device timer (~1s): when a set_timer elapses, ring the alarm until the screen is tapped.
 static void timer_alert_task(void *arg)
 {
+    QueueHandle_t q = device_tools_timer_queue();
     char label[40];
     for (;;) {
-        vTaskDelay(pdMS_TO_TICKS(1000));
-        if (device_tools_timer_take_fired(label, sizeof label))
+        uint8_t sig;
+        xQueueReceive(q, &sig, portMAX_DELAY);   // BLOCKS until a set_timer fires — no periodic wake,
+        if (device_tools_timer_take_fired(label, sizeof label))   // so the CPU can light-sleep until then
             run_timer_alarm(label);
     }
 }

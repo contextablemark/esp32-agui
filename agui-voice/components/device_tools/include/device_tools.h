@@ -7,6 +7,8 @@
 
 #include <stdbool.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "esp_err.h"
 #include "cJSON.h"
 
@@ -40,6 +42,9 @@ bool device_tools_is_client(const char *name);
 // set_timer accessors (the tool itself never touches the UI to avoid a chat_ui<->device_tools cycle):
 int  device_tools_timer_remaining(void);                  // seconds left on the active timer, 0 if none
 bool device_tools_timer_take_fired(char *label, size_t n); // true ONCE after a timer elapses (copies label)
+// Queue signaled (1 item) when a set_timer elapses — block on it instead of polling so the CPU can
+// light-sleep until the deadline. Drain with device_tools_timer_take_fired().
+QueueHandle_t device_tools_timer_queue(void);
 
 #ifdef __cplusplus
 }

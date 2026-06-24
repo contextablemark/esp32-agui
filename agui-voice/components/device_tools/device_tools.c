@@ -5,6 +5,8 @@
 #include <string.h>
 #include <time.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
@@ -13,6 +15,7 @@
 static const char *TAG = "device_tools";
 
 static void register_builtins(void);   // defined with the tool registry (P7), below
+static QueueHandle_t s_timer_q;        // signaled when a set_timer fires (lets the alert task block, not poll)
 
 // Ambient context (P5): read-only device signals pushed to the agent each run via
 // RunAgentInput.context. The AG-UI Context.value is a STRING, so structured signals are
@@ -23,6 +26,7 @@ static void register_builtins(void);   // defined with the tool registry (P7), b
 esp_err_t device_tools_init(void)
 {
     ESP_LOGI(TAG, "init");
+    s_timer_q = xQueueCreate(1, sizeof(uint8_t));   // set_timer fire signal (block on it, don't poll)
     register_builtins();   // P7: register builtin client tools (set_timer, ...)
     return ESP_OK;
 }
@@ -225,8 +229,11 @@ static void timer_fire_cb(void *arg)
     (void)arg;
     s_timer_deadline_us = 0;
     s_timer_fired = true;
+    if (s_timer_q) { uint8_t sig = 1; xQueueSend(s_timer_q, &sig, 0); }   // wake the alert task (cb runs in task ctx)
     ESP_LOGI(TAG, "timer fired: %s", s_timer_label[0] ? s_timer_label : "(timer)");
 }
+
+QueueHandle_t device_tools_timer_queue(void) { return s_timer_q; }
 
 static esp_err_t tool_set_timer(const cJSON *args, cJSON **result)
 {
