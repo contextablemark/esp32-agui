@@ -41,6 +41,10 @@ void  chat_ui_note_activity(void);
 // this suspends the idle power-saver so it doesn't fight the flashing; pass false to resume (the saver
 // treats the screen as on + active). Lets an alert flash the panel without the saver blanking it.
 void     chat_ui_alarm_set(bool on);
+// Flash the alarm ring on/off, in time with the beeps. Toggles the ring's visibility inside the
+// overlay (the panel stays at a steady brightness while ringing — toggling the panel brightness gets
+// starved by LVGL's lock/flush). Cheap; no-op if no alarm is active. Called from the timer task.
+void     chat_ui_alarm_flash(bool on);
 // ms since the last touch (LVGL input inactivity — object-independent, so a tap anywhere counts),
 // or UINT32_MAX if the LVGL lock is momentarily busy. Used to detect a tap-to-dismiss during an alarm.
 uint32_t chat_ui_touch_idle_ms(void);

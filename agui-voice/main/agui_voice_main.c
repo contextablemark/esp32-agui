@@ -385,14 +385,6 @@ static esp_err_t ptt_button_init(void)
 static const int ALARM_LEVELS[] = { 6500, 10000, 15000, 21000, 28000 };  // ~0.20,0.30,0.46,0.64,0.85 FS
 #define ALARM_NLEVELS ((int)(sizeof ALARM_LEVELS / sizeof ALARM_LEVELS[0]))
 
-// Flash the panel, serialized with LVGL via the display lock — the brightness command (0x51) shares
-// the QSPI io handle with LVGL's flush, so unlocked rapid toggling collides and gets dropped (the
-// panel just stays put). Locking makes the flash reliable.
-static void alarm_screen(bool on)
-{
-    if (bsp_display_lock(100)) { bsp_display_brightness_set(on ? ALARM_BRIGHT : 0); bsp_display_unlock(); }
-}
-
 // True once a fresh dismiss tap is seen — but only after the screen has first gone quiet, so a tap
 // just before the timer fired doesn't instantly dismiss it. `*armed` persists across calls.
 static bool alarm_dismiss_tap(bool *armed)
@@ -416,9 +408,10 @@ static void run_timer_alarm(const char *label)
         if (want != level) { level = want; fill_tone(s_alarm_pcm, ALARM_FREQ, ALARM_LEVELS[level]); }
 
         for (int i = 0; i < ALARM_BEEPS && !done; i++) {
-            alarm_screen(true);                  // red ring ON, in sync with the beep…
+            chat_ui_alarm_flash(true);           // red ring ON (LVGL paints it; panel stays lit)…
+            vTaskDelay(pdMS_TO_TICKS(20));        // let the "on" frame land before the beep
             play_beep(s_alarm_pcm);              // ~90ms (blocks)
-            alarm_screen(false);                 // …and dark between
+            chat_ui_alarm_flash(false);          // …ring hidden (dark) between
             vTaskDelay(pdMS_TO_TICKS(ALARM_GAP_MS));
             if (alarm_dismiss_tap(&armed) || s_listening) done = true;
         }

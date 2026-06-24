@@ -279,6 +279,7 @@ static bool              s_force_off_armed;             // PWR-tapped off; stays
 static uint32_t          s_force_off_ms;                // when the force-off press happened
 static volatile bool     s_alarm_active;                // a timer is ringing → it owns the screen
 static lv_obj_t         *s_alarm_overlay;               // full-screen black + red ring shown while ringing
+static lv_obj_t         *s_alarm_ring;                  // the red ring (toggled hidden/visible to flash)
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 
@@ -306,19 +307,42 @@ void chat_ui_alarm_set(bool on)
                 lv_obj_set_style_border_width(ring, 14, 0);
                 lv_obj_center(ring);
                 lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+                lv_obj_add_flag(ring, LV_OBJ_FLAG_HIDDEN);           // start dark; flash reveals it
+                s_alarm_ring = ring;
             }
             bsp_display_unlock();
         }
         s_alarm_active = true;
+        // Steady brightness for the whole alarm: flash by toggling the RING (in the LVGL task), NOT by
+        // toggling the panel — rapid brightness commands (0x51) share the QSPI io handle with LVGL's
+        // flush and get dropped under contention (the panel just stays dark). Set it once here.
+        bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
     } else {
         s_alarm_active = false;
         if (bsp_display_lock(1000)) {
-            if (s_alarm_overlay) { lv_obj_del(s_alarm_overlay); s_alarm_overlay = NULL; }
+            if (s_alarm_overlay) { lv_obj_del(s_alarm_overlay); s_alarm_overlay = NULL; s_alarm_ring = NULL; }
             bsp_display_unlock();
         }
         s_screen_on = true;             // alarm ended: screen is on, resync the saver
         s_force_off_armed = false;
         chat_ui_note_activity();
+    }
+}
+
+// Flash the alarm ring on/off in time with the beeps by toggling its HIDDEN flag (the panel stays at
+// a steady brightness). Cheap: a flag flip + small invalidate under a short lock — the LVGL task does
+// the partial redraw on its next cycle, so this never blocks the caller and never fights LVGL's flush
+// for a full-screen brightness toggle. No-op if the alarm overlay isn't up. Called from the timer task.
+void chat_ui_alarm_flash(bool on)
+{
+    if (!s_alarm_ring) return;
+    if (bsp_display_lock(80)) {
+        if (s_alarm_ring) {                          // re-check under lock (teardown may have run)
+            if (on) lv_obj_clear_flag(s_alarm_ring, LV_OBJ_FLAG_HIDDEN);
+            else    lv_obj_add_flag(s_alarm_ring, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_invalidate(s_alarm_ring);         // mark its 220x220 area dirty for the next flush
+        }
+        bsp_display_unlock();
     }
 }
 
