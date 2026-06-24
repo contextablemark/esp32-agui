@@ -626,8 +626,12 @@ static lv_display_t *bsp_display_lcd_init(const bsp_display_cfg_t *cfg)
             // Draw buffers in INTERNAL DMA-capable RAM (allocated once at init), not PSRAM: a
             // PSRAM draw buffer forces the QSPI flush to allocate a per-transfer internal bounce
             // buffer, which fails (ESP_ERR_NO_MEM "Draw bitmap failed") once WiFi/TLS/audio claim
-            // internal RAM. Smaller height keeps the 2× double buffer lean (~44 KB internal).
-            .buffer_height = 30,
+            // internal RAM. Smaller height keeps the 2× double buffer lean: 20 rows ≈ 29 KB internal
+            // (was 30 rows / ~44 KB) — the ~15 KB freed is headroom for the Soniox WSS/TLS, which
+            // compete for contiguous internal RAM during a turn (internal_max can dip to ~8 KB) and
+            // even more so once light sleep is enabled. 20-row bands add a few flush tiles per full
+            // redraw — imperceptible for this chat UI.
+            .buffer_height = 20,
             .use_psram = false,
             .enable_ppa_accel = false,
             .require_double_buffer = true,
