@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
@@ -321,4 +322,31 @@ extern "C" esp_err_t agui_tool_result(const char* tool_call_id, const cJSON* res
     } catch (...) {}
     xSemaphoreGive(s_lock);
     return ret;
+}
+
+// PTT barge-in: abort the in-flight run from another task. No s_lock (the blocked agui_run holds it).
+// cancelRun() flips an atomic the SSE read loop polls and is internally serialised on m_currentRunKey.
+extern "C" void agui_abort(void) {
+    if (s_agent) s_agent->cancelRun();
+}
+
+// After an abort, the SDK may hold a half-streamed assistant message (appended at TEXT_MESSAGE_START).
+// Pop it so it doesn't leak into the next run's context. Only ever called from the abort path, so a
+// trailing assistant message here is always the aborted partial (a completed reply is never dropped).
+extern "C" void agui_drop_partial_assistant(void) {
+    if (!s_lock) agui_client_init();
+    xSemaphoreTake(s_lock, portMAX_DELAY);
+    try {
+        if (s_agent) {
+            std::vector<agui::Message> msgs = s_agent->messages();   // copy (messages() returns a const ref)
+            if (!msgs.empty() && msgs.back().role() == agui::MessageRole::Assistant) {
+                msgs.pop_back();
+                s_agent->setMessages(msgs);                          // replace history (reindexes internally)
+                ESP_LOGI(TAG, "dropped partial assistant message after abort");
+            }
+        }
+    } catch (const std::exception& e) {
+        ESP_LOGE(TAG, "drop_partial failed: %s", e.what());
+    } catch (...) {}
+    xSemaphoreGive(s_lock);
 }

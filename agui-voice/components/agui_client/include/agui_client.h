@@ -52,6 +52,18 @@ esp_err_t agui_run(const agui_cfg_t *cfg, const char *user_text,
 
 esp_err_t agui_tool_result(const char *tool_call_id, const cJSON *result);
 
+// Abort the in-flight agent run (if any) — for PTT barge-in. Callable from ANY task (e.g. a button
+// cb): it takes NO agui lock, only flips the SDK's per-run atomic cancel flag that the SSE read loop
+// polls, so it won't deadlock against the blocking agui_run() that holds s_lock. No-op if no run is
+// active. The aborted run surfaces as on_error("...cancelled...") — the caller must distinguish that
+// deliberate cancel from a real error (see s_aborting in main).
+void agui_abort(void);
+
+// Drop a trailing PARTIAL assistant message from SDK history (the half-streamed reply left by an
+// abort) so it can't poison the next run's context. No-op if history is empty or its tail isn't an
+// assistant message. Takes s_lock → call only BETWEEN runs (ptt_task), never from a handler.
+void agui_drop_partial_assistant(void);
+
 #ifdef __cplusplus
 }
 #endif

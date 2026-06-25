@@ -164,8 +164,13 @@ void HttpAgent::setHttpService(std::unique_ptr<IHttpService> service) {
 }
 
 void HttpAgent::cancelRun() {
-    if (!m_currentRunKey.empty()) {
-        m_httpService->cancelRequest(m_currentRunKey);
+    // [device] Called from any task/core (e.g. a button cb) to abort the in-flight run. Copy the key
+    // under the mutex (runAgent() may be writing/clearing it concurrently), then cancel outside the
+    // lock. Empty key (no active run) → no-op. cancelRequest() has its own mutex; no deadlock.
+    std::string key;
+    { std::lock_guard<std::mutex> lk(m_runKeyMutex); key = m_currentRunKey; }
+    if (!key.empty()) {
+        m_httpService->cancelRequest(key);
     }
 }
 
@@ -240,13 +245,14 @@ void HttpAgent::runAgent(const RunAgentParams& params, AgentSuccessCallback onSu
     }
 
     m_currentInput = input;  // persisted so SSE-phase middleware context can reference it
-    m_currentRunKey = input.runId;
+    { std::lock_guard<std::mutex> lk(m_runKeyMutex); m_currentRunKey = input.runId; }  // [device] guarded write
 
     // [device] No libcurl default on ESP-IDF — the caller must inject a transport via
     // setHttpService() before running. Fail cleanly instead of dereferencing null.
     if (!m_httpService) {
         if (onError) invokeErrorCallback(onError, "no IHttpService set (call setHttpService)");
         cleanupPerRunSubscribers();
+        { std::lock_guard<std::mutex> lk(m_runKeyMutex); m_currentRunKey.clear(); }  // [device] no run started
         return;
     }
 
@@ -308,6 +314,10 @@ void HttpAgent::runAgent(const RunAgentParams& params, AgentSuccessCallback onSu
             invokeErrorCallback(onError, std::string("Failed to start agent run: ") + e.what());
         }
     }
+    // [device] sendSseRequest() ran synchronously above, so the run is over on every path that
+    // reaches here. Clear the key so a late cancelRun() (e.g. a barge-in press that lands just after
+    // the run ends) is a guaranteed no-op rather than cancelling a stale/next run.
+    { std::lock_guard<std::mutex> lk(m_runKeyMutex); m_currentRunKey.clear(); }
 }
 
 void HttpAgent::cleanupPerRunSubscribers() {

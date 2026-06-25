@@ -61,6 +61,16 @@ scheduler **at startup → boot loop**. Replaced with one shared `static std::mt
 compiles/passes the host tests either way, so **this class of bug is on-target-only**; watch for any
 re-introduced `thread_local` on resync (`grep -rn thread_local src`).
 
+### E. `cancelRun()` / `m_currentRunKey` made cross-task safe (device PTT barge-in)
+`src/agent/http_agent.{h,cpp}` — the device cancels an in-flight run from a **button-callback task**
+(PTT barge-in → `cancelRun()`) while `runAgent()` is blocked on the SSE read on another task. Upstream
+reads/writes `std::string m_currentRunKey` with no synchronisation, which is a data race on dual-core
+(ESP32-S3) and could tear a `std::string` read → crash. Added `std::mutex m_runKeyMutex` guarding the
+write (`runAgent`), a clear on every run-end path (so a late `cancelRun()` after the run finishes is a
+guaranteed no-op, not a stale-key cancel), and the read+copy in `cancelRun()`. `cancelRequest()` already
+has its own mutex; the two locks never nest, so no deadlock. Embedded concurrency hardening — harmless
+on host. (Pairs with `agui_abort()` in the `agui_client` shim.)
+
 ## Not changed
 Unknown event types are intentionally left to upstream's behavior: `parseSseEventData()` already
 catches the `parseEventType()` throw and **skips** unknown types with a warning (forward-compatible),

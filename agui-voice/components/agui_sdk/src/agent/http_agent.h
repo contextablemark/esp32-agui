@@ -2,6 +2,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
@@ -162,8 +163,12 @@ private:
     std::optional<AgentError> m_runError;
     EventVerifier m_eventVerifier;
 
-    // Cancel key for the active request; used by cancelRun() to abort in-flight requests
+    // Cancel key for the active request; used by cancelRun() to abort in-flight requests.
+    // [device] Guarded by m_runKeyMutex: cancelRun() may read it from another task/core (a button
+    // cb) while runAgent() writes it on the run task — an unguarded std::string read/write is a
+    // data race on dual-core (ESP32-S3). The mutex serialises the write/clear with the read.
     std::string m_currentRunKey;
+    std::mutex  m_runKeyMutex;
 };
 
 }  // namespace agui

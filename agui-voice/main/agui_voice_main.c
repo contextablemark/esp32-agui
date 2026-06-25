@@ -28,6 +28,7 @@
 #include "net_prov.h"
 #include "app_cfg.h"
 #include "soniox_client.h"
+#include "soniox_tts_client.h"
 #include "agui_client.h"
 #include "device_tools.h"
 #include "chat_ui.h"
@@ -89,6 +90,16 @@ static void on_turn(const char *text, void *ctx)             // Soniox endpoint 
 static bool s_assist_started;          // assistant bubble open for the current message?
 static bool s_run_error;               // run ended in error → keep the "Error" status visible
 
+#define TTS_TEXT_MAX 2048              // P-a: cap the buffered reply (well under Soniox's 5000-char frame)
+static char   s_tts_text[TTS_TEXT_MAX]; // whole reply accumulated across the turn → spoken at the end
+static size_t s_tts_len;
+
+// P-c PTT barge-in: a press DURING a reply aborts it. s_responding is true for the whole
+// run_agent_turn (the gate ptt_down_cb checks to decide "this press is a barge-in"); s_aborting is the
+// one-shot the button cb sets so h_error suppresses the cancel-as-error and run_agent_turn bails clean.
+static volatile bool s_responding;
+static volatile bool s_aborting;
+
 // --- P7 client tools: pending list ------------------------------------------------------------
 // Client-tool calls the agent makes during a run are RECORDED here by h_tool_call (which runs INSIDE
 // agui_run under s_lock — so it may only copy strings, never dispatch/re-run). run_agent_turn drains
@@ -124,6 +135,14 @@ static void h_text_delta(const char *d, void *c)
         s_assist_started = true;
     }
     chat_ui_append_assistant(d);
+    if (d && *d) {                           // accumulate the whole reply for batch TTS (P-a)
+        size_t dl = strlen(d);
+        if (s_tts_len + dl < sizeof s_tts_text) {
+            memcpy(s_tts_text + s_tts_len, d, dl);
+            s_tts_len += dl;
+            s_tts_text[s_tts_len] = '\0';
+        }
+    }
     printf("%s", d); fflush(stdout);
 }
 static void h_text_end(void *c)
@@ -156,6 +175,10 @@ static void h_tool_call(const char *id, const char *name, const char *args, void
 static void h_run_finished(void *c) { ESP_LOGI("agui", "run finished"); }
 static void h_error(const char *m, void *c)
 {
+    if (s_aborting) {                        // deliberate barge-in cancel — not a failure
+        ESP_LOGI("agui", "run cancelled (barge-in): %s", m);
+        return;                              // leave s_run_error false + the UI to the new turn
+    }
     ESP_LOGE("agui", "run error: %s", m);
     chat_ui_status("Error");
     s_run_error = true;
@@ -171,6 +194,8 @@ static const agui_handlers_t s_handlers = {
     .on_error        = h_error,
 };
 
+static void tts_speak_reply(const char *text);   // defined with the speaker helpers below
+
 // Render the user turn, run one AG-UI turn (streams the reply into the chat), restore the idle hint.
 static void run_agent_turn(const char *text)
 {
@@ -185,8 +210,11 @@ static void run_agent_turn(const char *text)
     }
     bool have_tok = app_cfg_get(APP_CFG_AGUI_TOKEN, token, sizeof token);
 
+    s_responding     = true;                       // P-c: a BOOT press from here on is a barge-in
     s_assist_started = false;
     s_run_error      = false;
+    s_tts_len        = 0;
+    s_tts_text[0]    = '\0';
     chat_ui_status("Thinking...");
     agui_cfg_t acfg = { .endpoint = url, .auth_bearer = have_tok ? token : NULL, .thread_id = NULL };
     cJSON *tools    = device_tools_manifest();     // advertised on EVERY run (NULL ⇒ no tools)
@@ -197,6 +225,7 @@ static void run_agent_turn(const char *text)
     // agui_tool_result call happens HERE on ptt_task with s_lock free between them (no deadlock).
     const char *user_text = text;                  // first run carries the utterance; continuations don't
     for (int iter = 0; iter < AGUI_TOOL_MAX_ITERS; iter++) {
+        if (s_aborting) break;                     // P-c: barge-in landed between runs (e.g. tool exec) → stop
         s_pending_n        = 0;                    // reset capture for THIS run
         s_pending_overflow = false;
 
@@ -204,6 +233,10 @@ static void run_agent_turn(const char *text)
         agui_run(&acfg, user_text, device_ctx, tools, NULL, &s_handlers, NULL);  // BLOCKS; fills s_pending
         cJSON_Delete(device_ctx);
 
+        if (s_aborting) {                          // P-c: barged in mid-run → drop the partial reply, bail
+            agui_drop_partial_assistant();         // so a half-streamed assistant msg can't poison the next run
+            break;
+        }
         if (s_run_error)   break;                  // transport/RUN_ERROR → stop (h_error kept "Error" up)
         if (s_pending_n == 0) break;               // no client tool calls → turn complete
         if (s_pending_overflow) ESP_LOGW(TAG, "tool calls truncated to %d this run", PEND_MAX);
@@ -228,7 +261,15 @@ static void run_agent_turn(const char *text)
     }
 
     cJSON_Delete(tools);                           // cJSON_Delete(NULL) is safe
-    if (!s_run_error) chat_ui_status(IDLE_HINT);   // success → idle prompt; on error keep "Error" up
+    if (s_aborting)  { s_responding = false; return; }  // barge-in: the new turn owns the UI — touch nothing
+    if (s_run_error) { s_responding = false; return; }  // error → keep "Error" up, don't speak
+    if (s_tts_len > 0) {                           // P-a: speak the whole buffered reply (batch TTS).
+        chat_ui_status("Speaking...");             // WSS opens now — the SSE is already closed (sequential TLS)
+        tts_speak_reply(s_tts_text);
+        if (s_aborting) { s_responding = false; return; }  // barged in DURING playback → don't repaint idle
+    }
+    chat_ui_status(IDLE_HINT);                     // back to the idle prompt
+    s_responding = false;
 }
 
 // ---- PTT "go ahead and talk" beep -------------------------------------------------------------
@@ -277,6 +318,25 @@ static void fill_tone(int16_t *buf, int freq, int ampl)
     }
 }
 
+// Lazily bring up the speaker (once). Returns true if s_spk is open at 16k/16/mono. The speaker is a
+// second esp_codec_dev OUT handle that coexists with the always-open mic on the single ES8311 — both
+// MUST use the same 16k rate. lp_idle closes it; the next beep/TTS write reopens it here.
+static bool spk_ensure(void)
+{
+    if (s_spk) return true;
+    s_spk = bsp_audio_codec_speaker_init();                 // pa_pin = GPIO46, raised automatically
+    if (!s_spk) { ESP_LOGW(TAG, "speaker init failed"); return false; }
+    esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);             // 0-100 index, NOT dB
+    esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = BEEP_SR };
+    if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) {         // same 16k as the mic → full-duplex OK
+        ESP_LOGW(TAG, "speaker open failed");
+        s_spk = NULL;                                       // retry on the next call
+        return false;
+    }
+    ESP_LOGI(TAG, "speaker ready (16k mono)");
+    return true;
+}
+
 // Lazily bring up the speaker (once) and play one precomputed tone. Blocks (~90 ms) until it is
 // clocked out of the I2S TX DMA. Call ONLY from a task (ptt_task / timer task), never a button cb.
 static void play_beep(const int16_t *pcm)
@@ -285,22 +345,29 @@ static void play_beep(const int16_t *pcm)
         fill_tone(s_cue_pcm, CUE_FREQ, CUE_AMPL);   // alarm buffer at its current escalation level
         s_beep_ready = true;
     }
-    if (!s_spk) {
-        s_spk = bsp_audio_codec_speaker_init();                 // pa_pin = GPIO46, raised automatically
-        if (!s_spk) { ESP_LOGW(TAG, "beep: speaker init failed"); return; }
-        esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);             // 0-100 index, NOT dB
-        esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = BEEP_SR };
-        if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) {         // same 16k as the mic → full-duplex OK
-            ESP_LOGW(TAG, "beep: speaker open failed");
-            s_spk = NULL;                                       // retry on the next call
-            return;
-        }
-        ESP_LOGI(TAG, "beep: speaker ready (16k mono)");
-    }
+    if (!spk_ensure()) return;
     esp_codec_dev_write(s_spk, (int16_t *)pcm, BEEP_SAMPLES * sizeof(int16_t));   // API wants non-const
 }
 
 static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
+
+// TTS PCM sink: the soniox_tts_client drain task hands decoded pcm_s16le (16k/mono) here. main owns
+// the single speaker handle, so TTS shares it with the beep + the low-power codec-close (no 2nd handle).
+static void tts_pcm_write(const void *pcm, size_t bytes)
+{
+    if (!spk_ensure()) return;
+    esp_codec_dev_write(s_spk, (void *)pcm, bytes);
+}
+
+#define TTS_VOL 90      // spoken replies louder than the subtle PTT beep (BEEP_VOL); 0-100 index, NOT dB
+// Speak a full reply at TTS volume, restoring the beep volume afterward so the next PTT cue / alarm
+// (which share s_spk) keep their tuned loudness.
+static void tts_speak_reply(const char *text)
+{
+    if (spk_ensure()) esp_codec_dev_set_out_vol(s_spk, TTS_VOL);
+    soniox_tts_speak(text);
+    if (s_spk) esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);
+}
 
 // --- Idle low-power: when the display is off AND on battery, shed WiFi + the codec/I2S and let the
 // CPU light-sleep --------------------------------------------------------------------------------
@@ -368,7 +435,9 @@ static void ptt_task(void *arg)
         int ev;
         if (xQueueReceive(s_ptt_q, &ev, portMAX_DELAY) != pdTRUE) continue;
 
-        if (ev == 1 && !s_listening) {                 // PRESS
+        if (ev == 1 && !s_listening) {                 // PRESS (incl. a barge-in restart)
+            s_aborting   = false;                      // P-c: consume the barge-in flags for the new turn
+            s_responding = false;                      // (the aborted turn is fully torn down by now)
             s_ptt_final[0] = '\0';
             s_ptt_run[0]   = '\0';
             s_listening = true;
@@ -421,7 +490,17 @@ static void ptt_task(void *arg)
 
 // Any BOOT-button interaction wakes the display (note_activity un-arms a PWR-forced-off screen too),
 // so reaching for the button to talk lights the screen even if it had blanked.
-static void ptt_down_cb(void *btn, void *ctx) { chat_ui_note_activity(); int e = 1; xQueueSend(s_ptt_q, &e, 0); }  // hold → talk
+static void ptt_down_cb(void *btn, void *ctx)
+{
+    chat_ui_note_activity();
+    if (s_responding) {                  // P-c BARGE-IN: a press while a reply is in flight aborts it
+        ESP_LOGI(TAG, "barge-in: aborting active reply");
+        s_aborting = true;               // set BEFORE agui_abort so h_error (fires inline) suppresses "Error"
+        agui_abort();                    // cancel the AG-UI run (no-op if already past it)
+        soniox_tts_cancel();             // stop TTS playback (no-op if not speaking)
+    }
+    int e = 1; xQueueSend(s_ptt_q, &e, 0);   // enqueue the press; ptt_task starts a fresh turn once unblocked
+}
 static void ptt_up_cb(void *btn, void *ctx)   { chat_ui_note_activity(); int e = 0; xQueueSend(s_ptt_q, &e, 0); }  // release
 static void ptt_dbl_cb(void *btn, void *ctx)  { chat_ui_note_activity(); int e = 2; xQueueSend(s_ptt_q, &e, 0); }  // double-tap → setup
 
@@ -541,6 +620,7 @@ void app_main(void)
 
     // Bring the mic up now; the Soniox WSS opens only on a PTT press.
     if (soniox_client_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");
+    if (soniox_tts_init(tts_pcm_write) != ESP_OK) ESP_LOGE(TAG, "tts init failed");  // P-a: spoken replies
 
     power_mgmt_start();   // low-power: light sleep when idle (creates the lp mutex before ptt_task uses it)
 

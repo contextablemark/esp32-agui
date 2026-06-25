@@ -6,6 +6,7 @@ idf_component_register(
         net_prov
         app_cfg
         soniox_client
+        soniox_tts_client
         agui_client
         device_tools
         chat_ui
