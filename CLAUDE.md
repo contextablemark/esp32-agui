@@ -38,10 +38,10 @@ solving** with:
 ERROR: Version solving failed: no versions of idf match >=5.5.0,<6.0.0
 ```
 
-If you see that, you're on the wrong IDF. The devcontainer is pinned in
-[.devcontainer/Dockerfile](.devcontainer/Dockerfile) to `espressif/idf:release-v5.5`
-(swap in `v5.5.1` for an exact frozen pin) — **rebuild the container** to apply
-("Dev Containers: Rebuild Container"). Target chip is always **esp32s3**.
+If you see that, you're on the wrong IDF. Install ESP-IDF **5.5.x** (e.g.
+`git clone -b v5.5.1 --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf &&
+~/esp/esp-idf/install.sh esp32s3`, then `. ~/esp/esp-idf/export.sh`). Target chip is always
+**esp32s3**.
 
 ## Layout
 
@@ -63,15 +63,14 @@ If you see that, you're on the wrong IDF. The devcontainer is pinned in
 
 ## Build / flash / run
 
-Run from inside an example dir, e.g. `examples/ESP-IDF-v5.5.1/05_LVGL_WITH_RAM`.
-(`source /opt/esp/idf/export.sh` first; the devcontainer's `.bashrc` already does this.)
+Run from inside an example dir, e.g. `examples/ESP-IDF-v5.5.1/05_LVGL_WITH_RAM`
+(source the IDF env first: `. ~/esp/esp-idf/export.sh`).
 
 - **Build:** `idf.py build` — target esp32s3 comes from `sdkconfig.defaults`; don't run
   `set-target` (it wipes `sdkconfig`).
-- **Flash + monitor (real HW):** `idf.py -p <PORT> flash monitor`.
-  This cloud container has **no USB**, so either (a) flash from your browser with the
-  **`esp-idf-web`** extension (WebSerial, already installed), or (b) pass the board
-  through to the container (it runs `--privileged`).
+- **Flash + monitor (real HW):** `idf.py -p <PORT> flash monitor` — `<PORT>` e.g.
+  `/dev/ttyACM0` (Linux), `/dev/cu.usbmodem*` (macOS), or `COMx` (Windows), over the
+  board's USB-C (native USB Serial/JTAG).
 - **QEMU:** `idf.py qemu` — **CPU/RAM/UART only.** The AMOLED, touch, I²C sensors, SD,
   and codec are **not emulated**, so it's for boot/app-logic/networking, not the UI.
 - **Config / clean:** `idf.py menuconfig` · `idf.py fullclean`.

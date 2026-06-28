@@ -285,5 +285,5 @@ Advertised in `RunAgentInput.tools`; on `TOOL_CALL_*` the device executes locall
   - `app-pixels/ai-assistant-claude` — font handling + chat/status UI + agentic tool loop
 - Soniox real-time WebSocket API: `soniox.com/docs/stt`
 - Board base: `examples/ESP-IDF-v5.5.1/05_LVGL_WITH_RAM` and `06_I2SCodec`
-- Flashing (no-USB container → browser/WebSerial): `docs/flashing.md`
+- Flashing (USB-C `idf.py flash` + NVS-wipe recovery): `docs/flashing.md`
 - Use `/idf-docs` for DeepWiki lookups against these repos.

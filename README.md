@@ -5,20 +5,25 @@ Custom **ESP-IDF 5.5.x** firmware that turns a **Waveshare ESP32-S3-Touch-AMOLED
 
 The device captures mic audio and streams it to **[Soniox](https://soniox.com)** for real-time
 speech-to-text, is itself the **AG-UI client** (it POSTs `RunAgentInput` and consumes the SSE
-event stream directly on-device), and renders the conversation plus live agent activity on the
-1.8″ AMOLED via **LVGL 8.4**. Because the AG-UI client lives on the device, agent events
-(`TOOL_CALL_*`, reasoning, interrupts) drive the screen, and the board can expose its own
-sensors / screen / touch back to the agent as tools and ambient context.
+event stream directly on-device), renders the conversation plus live agent activity on the
+1.8″ AMOLED via **LVGL 8.4**, and **speaks the reply back** with streaming Soniox text-to-speech.
+Because the AG-UI client lives on the device, agent events (`TOOL_CALL_*`, reasoning, run
+lifecycle) drive the screen, and the board exposes its own sensors / screen / clock back to the
+agent as tools and ambient context.
 
-> **Status:** v1 in progress — P0–P4 implemented (WiFi + provisioning, Soniox streaming STT,
-> AG-UI text client, LVGL chat UI, live agent-status line). P5–P8 (ambient context, HITL
-> interrupts, client tools, hardening) are planned. See [Roadmap](#roadmap).
+> **Status:** v1 functional and hardware-verified. Streaming STT, the AG-UI text client, the LVGL
+> chat + live-status UI, **spoken replies (streaming TTS with push-to-talk barge-in)**, **ambient
+> context** (time + battery + selected voice), the **`set_timer` client tool** (with an on-device
+> ringing alarm), a **captive-portal voice picker**, **volume buttons**, **eyes-free touch-to-talk**,
+> and **idle power saving** are all implemented and working on hardware. HITL interrupts and Soniox
+> ephemeral keys remain (see [Roadmap](#roadmap)).
 
 ```
-mic ─ES8311/I²S(16k s16le)─▶ Soniox WSS (streaming) ─▶ live transcript
+mic ─ES8311/I²S(16k s16le)─▶ Soniox STT (streaming WSS) ─▶ live transcript
    ─▶ AG-UI: POST RunAgentInput{messages, context} ─▶ SSE event stream
    ─▶ LVGL: chat bubbles (TEXT_*) · ephemeral status (REASONING_*/TOOL_CALL_*/RUN_*)
-   ─▶ (planned) client tools run on-device · interrupt prompts answered by touch
+   ─▶ reply text ─▶ Soniox TTS (streaming WSS) ─▶ ES8311 speaker  (barge-in to interrupt)
+   ─▶ client tools run on-device (set_timer → ringing alarm)
 ```
 
 ---
@@ -31,9 +36,9 @@ mic ─ES8311/I²S(16k s16le)─▶ Soniox WSS (streaming) ─▶ live transcrip
 |---|---|
 | **MCU** | ESP32-S3 (Xtensa LX7 dual-core, 240 MHz), 16 MB flash, 8 MB octal PSRAM @ 80 MHz |
 | **Display** | 1.8″ AMOLED, **368 × 448 px**, QSPI |
-| **Audio** | ES8311 codec + dual digital mics (16 kHz mono capture) |
+| **Audio** | ES8311 codec + dual digital mics (16 kHz mono capture) + speaker out |
 | **Sensors** | QMI8658 6-axis IMU · AXP2101 PMIC · PCF85063 RTC |
-| **Input** | Capacitive touch · top "BOOT" button (GPIO0) repurposed as push-to-talk |
+| **Input** | Capacitive touch (long-press anywhere = talk) · top **BOOT** button · **PWR** key |
 | **Other** | SD/MMC slot · 3.7 V Li battery (MX1.25) · USB-C (native USB Serial/JTAG) |
 
 Two hardware revisions are auto-detected at runtime by probing the touch controller over I²C —
@@ -55,19 +60,24 @@ serves both. Full pinout is in [CLAUDE.md](CLAUDE.md).
                                             │  (event router)
                   ┌─────────────────────────┼───────────────────────────┐
                   ▼            ▼             ▼              ▼             ▼
-              chat bubbles  ephemeral    interrupt      client tools   idle
-              (TEXT_*)      status       prompt (HITL)  (timer/qr)     timer
-        └────────────────────────────── AMOLED ─────────────────────────────┘
+              chat bubbles  ephemeral    client tools   reply text    idle
+              (TEXT_*)      status       (set_timer)    ─▶ TTS ─▶ spk  timers
+                                                        soniox_tts_client ══ wss ══▶ Soniox TTS
+        └────────────────────────────── AMOLED + speaker ───────────────────┘
 ```
 
-Secrets live in NVS. TLS sessions run **sequentially** (Soniox closes on end-of-speech before
-the AG-UI run opens), so peak load is one mbedTLS session; large buffers are kept in PSRAM.
-No barge-in (single ES8311, no echo-reference channel) → push-to-talk turn-taking.
+Secrets live in NVS. The mic→STT leg runs first (Soniox closes on end-of-speech), then the AG-UI
+run opens; the **TTS** stream overlaps the agent SSE so the reply is spoken as it arrives. mbedTLS
+buffers are kept in **PSRAM**, which is what lets the TTS WSS session coexist with the agent stream
+on a RAM-tight build. There is no acoustic barge-in (single ES8311, no echo-reference channel);
+instead, **starting a new turn cancels any in-progress speech** — push-to-talk turn-taking.
 
-The on-device AG-UI client is a from-scratch ESP-IDF port *inspired by* the community
-**C++ AG-UI SDK** (`ag-ui-protocol/ag-ui` → `sdks/community/c++`): libcurl → `esp_http_client`
-(streaming), nlohmann/json → cJSON, exceptions/RTTI dropped, buffers in PSRAM, plus three
-device extensions (per-run ambient `context`, interrupt → resume, client-tool dispatch).
+The on-device AG-UI client **vendors and extends the community C++ AG-UI SDK**
+(`ag-ui-protocol/ag-ui` → `sdks/community/c++`) under the `agui_sdk` component: libcurl →
+`esp_http_client` (streaming SSE), nlohmann/json → cJSON, plus device extensions (per-run ambient
+`context`, `REASONING_*` events, interrupt → resume, client-tool dispatch). `agui_client` is a thin
+`extern "C"` shim over the SDK's `HttpAgent` + an `IAgentSubscriber`. Local deltas to the vendored
+SDK are tracked in [agui_sdk/PATCHES.md](agui-voice/components/agui_sdk/PATCHES.md).
 
 ---
 
@@ -76,15 +86,14 @@ device extensions (per-run ambient `context`, interrupt → resume, client-tool 
 ```
 esp32-agui/
 ├── agui-voice/                  ← the ESP-IDF project (self-contained; build this)
-│   ├── main/                    ← app entry + PTT turn state machine
+│   ├── main/                    ← app entry + push-to-talk turn state machine
 │   ├── components/              ← first-party components (below) + vendored board BSP/drivers
-│   ├── sdkconfig.defaults       ← target esp32s3, TLS 1.3, PSRAM, LVGL config
+│   ├── sdkconfig.defaults       ← target esp32s3, TLS 1.3, PSRAM, power mgmt, LVGL config
 │   └── partitions.csv
 ├── docs/
 │   ├── agui-voice-plan.md       ← full design: components, APIs, state machine, build phases
-│   ├── flashing.md              ← flash workflow (cloud container has no USB)
-│   └── soniox-rt-protocol.md    ← verified Soniox real-time WSS protocol notes
-├── .devcontainer/               ← pinned to espressif/idf:release-v5.5
+│   ├── flashing.md              ← flash workflow + NVS-wipe recovery
+│   └── soniox-rt-protocol.md    ← verified Soniox real-time WSS protocol notes (STT + TTS)
 ├── .claude/commands/            ← /idf-build /idf-flash /idf-monitor /idf-qemu /idf-size /idf-docs
 ├── CLAUDE.md                    ← project guide (hardware, toolchain, layout, conventions)
 └── README.md                    ← you are here
@@ -94,12 +103,14 @@ esp32-agui/
 
 | Component | Responsibility |
 |---|---|
-| [`agui_client`](agui-voice/components/agui_client/) | AG-UI client: POST `RunAgentInput` → streaming SSE parser → event router → handler callbacks |
+| [`agui_client`](agui-voice/components/agui_client/) | Thin `extern "C"` shim over the vendored AG-UI SDK: POST `RunAgentInput` → handler callbacks |
+| [`agui_sdk`](agui-voice/components/agui_sdk/) | Vendored + ESP-ported community C++ AG-UI SDK (streaming SSE parser, event router) |
 | [`soniox_client`](agui-voice/components/soniox_client/) | ES8311 mic capture → Soniox WSS streaming STT → partial/final transcript callbacks |
-| [`chat_ui`](agui-voice/components/chat_ui/) | LVGL chat bubbles, ephemeral status line, (planned) interrupt prompt + QR |
-| [`net_prov`](agui-voice/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning |
-| [`app_cfg`](agui-voice/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer) |
-| [`device_tools`](agui-voice/components/device_tools/) | Ambient context (motion/battery/time) + client-tool registry (timer/alarm/QR) |
+| [`soniox_tts_client`](agui-voice/components/soniox_tts_client/) | Reply text → Soniox WSS streaming TTS → PCM → ES8311 speaker (cancelable for barge-in) |
+| [`chat_ui`](agui-voice/components/chat_ui/) | LVGL chat bubbles, ephemeral status line, touch-to-talk, screen power saver, ringing-alarm overlay |
+| [`net_prov`](agui-voice/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning (incl. voice/TZ) |
+| [`app_cfg`](agui-voice/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer, TZ, voice, volume) |
+| [`device_tools`](agui-voice/components/device_tools/) | Ambient context (battery/time/voice) + client-tool registry (`set_timer`) |
 | [`esp32_s3_touch_amoled_1_8`](agui-voice/components/esp32_s3_touch_amoled_1_8/) | Board BSP (display/touch/audio bring-up); vendored from the Waveshare LVGL example |
 | `board_variant`, `esp_lcd_*`, `espressif__*` | Vendored display/touch drivers + ESP component-registry deps |
 
@@ -111,17 +122,28 @@ The managed components cap at `idf <6.0` (e.g. `espressif/es8311` requires `>=4.
 **ESP-IDF 6.x breaks dependency solving**. If you see
 `ERROR: Version solving failed: no versions of idf match >=5.5.0,<6.0.0`, you're on the wrong IDF.
 
-The devcontainer ([.devcontainer/Dockerfile](.devcontainer/Dockerfile)) is pinned to
-`espressif/idf:release-v5.5`. Open the repo in VS Code → **Dev Containers: Reopen in Container**.
-Target chip is always **esp32s3** (comes from `sdkconfig.defaults` — don't run `idf.py set-target`,
-it wipes `sdkconfig`).
+Install **ESP-IDF 5.5.x** with the [official getting-started flow](https://docs.espressif.com/projects/esp-idf/en/v5.5/esp32s3/get-started/),
+or directly:
+
+```bash
+git clone -b v5.5.1 --recursive https://github.com/espressif/esp-idf.git ~/esp/esp-idf
+~/esp/esp-idf/install.sh esp32s3
+```
+
+Then source the environment in every shell you build from:
+
+```bash
+. ~/esp/esp-idf/export.sh
+```
+
+Target chip is always **esp32s3** — it comes from `sdkconfig.defaults`, so **don't run
+`idf.py set-target`** (it wipes `sdkconfig`).
 
 ---
 
 ## Build, flash, run
 
-All commands run from inside the project dir. The devcontainer's `.bashrc` already sources the
-IDF env (`source /opt/esp/idf/export.sh`).
+All commands run from inside the project dir.
 
 ```bash
 cd agui-voice
@@ -130,12 +152,15 @@ idf.py build
 
 ### Flashing
 
-This is a **cloud devcontainer with no USB passthrough**, so flash one of two ways:
+Connect the board with a USB-C **data** cable and flash over the chip's native USB Serial/JTAG:
 
-1. **Browser (WebSerial):** the [`esp-idf-web`](https://marketplace.visualstudio.com/items?itemName=Espressif.esp-idf-web)
-   VS Code extension is pre-installed — flash directly from the browser over WebSerial.
-2. **Local USB:** pass the board through to the container (it runs `--privileged`), then
-   `idf.py -p <PORT> flash monitor`.
+```bash
+idf.py -p <PORT> flash monitor
+```
+
+`<PORT>` is e.g. `/dev/ttyACM0` (Linux), `/dev/cu.usbmodem*` (macOS), or `COMx` (Windows). If the
+port doesn't enumerate, hold **BOOT**, tap **RESET**, then release **BOOT** to force ROM
+download mode.
 
 > ⚠️ **Flash the app alone at `0x10000`** (`build/agui_voice.bin`). Flashing a *merged* image at
 > `0x0` pads the NVS region (0x9000) with `0xFF` and **wipes your saved WiFi/keys**. See
@@ -159,23 +184,39 @@ are not emulated. Useful for boot / app-logic / networking, not the UI.
 ## First-run setup & usage
 
 1. **Provision.** With no saved credentials, the device starts a SoftAP captive portal named
-   **`AMOLED-setup`**. Join it from a phone, and the form lets you enter:
+   **`AMOLED-setup`**. Join it from a phone, and the form lets you set:
    - WiFi SSID + password
    - **Soniox API key**
    - **AG-UI endpoint URL** (+ optional bearer token)
+   - **Time zone** (POSIX `TZ` string, for the agent's ambient time context)
+   - **TTS voice** (dropdown of the 28 Soniox `tts-rt-v1` voices; default **Adrian**)
 
-   Submitted values are saved to NVS; the device connects and is ready.
+   Only the fields you fill in are overwritten; the confirmation page echoes the saved values.
+   Everything is stored in NVS, and the device connects.
 
-2. **Talk.** **Hold the top button** (the "BOOT" button) to talk — the Soniox session opens only
-   while held, with a live transcript scrolling across the top status line. **Release** to send the
-   utterance to your AG-UI agent; the reply streams into a chat bubble while the status line shows
-   what the agent is doing (`Thinking… → Reasoning… → Using web_search… →` reply).
+2. **Talk.** **Long-press anywhere on the screen** (eyes-free), or **hold the top BOOT button**, to
+   talk — the Soniox session opens only while held, with a live transcript scrolling across the top
+   status line. **Release** to send the utterance to your AG-UI agent. The reply streams into a chat
+   bubble *and is spoken aloud* while the status line shows what the agent is doing
+   (`Thinking… → Reasoning… → Using web_search… →` reply). **Start a new turn to barge in** and cut
+   off the current spoken reply.
 
-3. **Reconfigure without reflashing.** **Double-tap** the top button to reopen the setup portal and
-   change the endpoint / keys (only fields you fill in are overwritten).
+3. **Volume.** **Tap** the BOOT button to turn the volume **up**; **short-press** the PWR key to
+   turn it **down**. The level is persisted to NVS.
+
+4. **Reconfigure.** **Double-tap** the BOOT button to reopen the setup portal and change the
+   endpoint / keys / voice / time zone without reflashing.
+
+5. **Tools & alarms.** When the agent calls `set_timer`, the device runs an idle countdown and then
+   **rings** — an escalating beep with a flashing red-ring overlay; **tap the screen to dismiss**.
+
+The display **blanks after 60 s of inactivity** to save power and **wakes on any touch or button
+press**. On battery, idle also sheds WiFi + codec and drops the CPU into light sleep; the next turn
+reconnects (typically 1–3 s on first wake). A long PWR-key hold powers the device off (AXP2101).
 
 Configuration and secrets are stored in NVS (`appcfg` namespace for the Soniox key / AG-UI URL +
-token; `netprov` for WiFi). Soniox **ephemeral keys** (mint-on-demand) are planned for P8.
+token / TZ / voice / volume; `netprov` for WiFi). Soniox **ephemeral keys** (mint-on-demand) are
+planned (see Roadmap).
 
 ---
 
@@ -184,18 +225,21 @@ token; `netprov` for WiFi). Soniox **ephemeral keys** (mint-on-demand) are plann
 | Phase | Goal | Status |
 |---|---|---|
 | **P0** Environment + WiFi | IDF 5.5 pinned; `net_prov` multi-SSID connect + auto-reconnect | ✅ |
-| **P0.5** Provisioning | SoftAP captive portal (`AMOLED-setup`) + web form | ✅ |
+| **P0.5** Provisioning | SoftAP captive portal (`AMOLED-setup`) + web form (WiFi/keys/TZ/voice) | ✅ |
 | **P1** Soniox STT | `soniox_client`: ES8311 capture → WSS → transcript | ✅ |
-| **P2** AG-UI text | `agui_client` core (RunAgentInput + SSE + `TEXT_*`) | ✅ |
-| **P3** Chat UI | `chat_ui` chat list + streaming + BOOT-button PTT | ✅ |
+| **P2** AG-UI text | `agui_client`/`agui_sdk` (RunAgentInput + SSE + `TEXT_*`) | ✅ |
+| **P3** Chat UI | `chat_ui` chat list + streaming + BOOT/touch push-to-talk | ✅ |
 | **P4** Status | `REASONING_*`/`TOOL_CALL_*`/`RUN_*` → live status line | ✅ |
-| **P5** Context | ambient motion + battery + time → per-run `context` | ◻ planned |
+| **P5** Context | ambient battery + local time + selected voice → per-run `context` | ✅ |
+| **P7** Tools | `set_timer` (idle countdown → ringing alarm) round-trip | ✅ |
+| **TTS** Spoken replies | `soniox_tts_client`: streaming reply audio + barge-in | ✅ |
+| — UX | voice picker, volume buttons, eyes-free touch-to-talk, screen/idle power saving | ✅ |
 | **P6** Interrupt | detect HITL → render-by-`response_schema` → resume; `show_qr` | ◻ planned |
-| **P7** Tools | `set_timer` (idle countdown) + `set_alarm` (RTC) round-trip | ◻ planned |
 | **P8** Hardening | Soniox ephemeral keys, reconnect/backoff, PSRAM tuning, error states | ◻ planned |
 
-Backlog (post-P8): A2UI generative-UI rendering, wake-word turn control, Soniox accuracy tuning,
-v2 tools (`display_card`/`render_chart`/`ble_*`/`sd_*`), `STATE_*` + JSON-Patch shared state.
+Backlog (post-P8): A2UI generative-UI rendering, wake-word turn control, `device_motion` context,
+`set_alarm` (RTC), v2 tools (`display_card`/`render_chart`/`ble_*`/`sd_*`), `STATE_*` + JSON-Patch
+shared state.
 
 The full design — component APIs, runtime state machine, AG-UI event→UI mapping, and per-phase
 acceptance criteria — is in [docs/agui-voice-plan.md](docs/agui-voice-plan.md).
@@ -209,10 +253,10 @@ This project is licensed under the [MIT License](LICENSE).
 It builds on, ports, or interoperates with:
 
 - **AG-UI protocol** ([ag-ui-protocol/ag-ui](https://github.com/ag-ui-protocol/ag-ui)) — the
-  on-device client is a from-scratch ESP-IDF port inspired by the community **C++ SDK**
-  (`sdks/community/c++`); no SDK code is vendored here.
-- **Soniox** real-time STT (WSS, model `stt-rt-v5`) — protocol notes in
-  [docs/soniox-rt-protocol.md](docs/soniox-rt-protocol.md).
+  on-device client vendors and ESP-ports the community **C++ SDK** (`sdks/community/c++`); local
+  deltas are documented in [agui_sdk/PATCHES.md](agui-voice/components/agui_sdk/PATCHES.md).
+- **Soniox** real-time **STT** (model `stt-rt-v5`) and **TTS** (model `tts-rt-v1`) over WSS —
+  protocol notes in [docs/soniox-rt-protocol.md](docs/soniox-rt-protocol.md).
 - **Waveshare ESP32-S3-Touch-AMOLED-1.8 BSP + drivers**
   ([waveshareteam/ESP32-S3-Touch-AMOLED-1.8](https://github.com/waveshareteam/ESP32-S3-Touch-AMOLED-1.8))
   — vendored under `agui-voice/components/`.
