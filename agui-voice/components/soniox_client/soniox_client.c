@@ -197,8 +197,12 @@ static void capture_task(void *arg)
         esp_codec_dev_set_in_gain(s_mic, MIC_GAIN_DB);
         for (int i = 0; i < DRAIN_CHUNKS && !s_stop && !s_fatal; i++)
             esp_codec_dev_read(s_mic, buf, READ_CHUNK_BYTES);   // flush stale/crosstalk; content discarded
+        int diag_n = 0, diag_peak = 0;                          // DIAG: mic level (silence vs audio)
         while (!s_stop && !s_fatal) {
             if (esp_codec_dev_read(s_mic, buf, READ_CHUNK_BYTES) != ESP_OK) continue;
+            const int16_t *sm = (const int16_t *)buf;           // DIAG: track peak |sample| ~1s
+            for (int i = 0; i < READ_CHUNK_BYTES / 2; i++) { int a = sm[i]; if (a < 0) a = -a; if (a > diag_peak) diag_peak = a; }
+            if (++diag_n >= 50) { ESP_LOGI(TAG, "mic peak=%d", diag_peak); diag_n = 0; diag_peak = 0; }
             // Never block the mic. Drop the *whole* chunk if it won't fit (sender behind):
             // a partial write would split a 16-bit sample and desync 2-byte alignment for
             // the rest of the stream. Dropping a full even-sized chunk keeps alignment.
@@ -237,6 +241,8 @@ static void sender_task(void *arg)
             size_t n = xStreamBufferReceive(s_audio_sb, buf, SEND_MAX_BYTES, pdMS_TO_TICKS(100));
             if (n == 0) { if (s_stop || s_fatal) break; continue; }   // stop + drained -> exit
             if (s_fatal) continue;
+            // Ignore the return (known-good d0dd24b9 behavior): a slow/failed send just drops this chunk
+            // (a small gap) and we move on — don't risk a fatal flag during a reconnect flap.
             esp_websocket_client_send_bin(s_ws, (const char *)buf, n, pdMS_TO_TICKS(500));
         }
         heap_caps_free(buf);

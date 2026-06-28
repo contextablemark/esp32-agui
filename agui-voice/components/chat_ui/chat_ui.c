@@ -99,6 +99,7 @@ static lv_obj_t *add_bubble(bool user, uint32_t color, const char *text)
 
     lv_obj_t *row = lv_obj_create(s_chat);                  // full-width transparent row
     lv_obj_remove_style_all(row);
+    lv_obj_clear_flag(row, LV_OBJ_FLAG_CLICKABLE);          // press falls through to s_chat (touch-to-talk)
     lv_obj_set_width(row, lv_pct(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
@@ -107,6 +108,7 @@ static lv_obj_t *add_bubble(bool user, uint32_t color, const char *text)
 
     lv_obj_t *bub = lv_obj_create(row);
     lv_obj_remove_style_all(bub);
+    lv_obj_clear_flag(bub, LV_OBJ_FLAG_CLICKABLE);          // press falls through to s_chat (touch-to-talk)
     lv_obj_set_width(bub, LV_SIZE_CONTENT);     // bubble grows to its label…
     lv_obj_set_height(bub, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_color(bub, lv_color_hex(color), 0);
@@ -135,6 +137,8 @@ static void chat_ui_activity_evt_cb(lv_event_t *e)
     s_last_activity_ms = now_ms();
 }
 
+static void chat_ui_talk_evt_cb(lv_event_t *e);   // touch-to-talk; defined with the screen-power code below
+
 esp_err_t chat_ui_init(void)
 {
     if (!bsp_display_start()) { ESP_LOGE(TAG, "bsp_display_start failed"); return ESP_FAIL; }
@@ -158,7 +162,7 @@ esp_err_t chat_ui_init(void)
     lv_obj_set_style_text_color(s_status, lv_palette_main(LV_PALETTE_GREY), 0);
     lv_obj_set_style_text_font(s_status, CHAT_FONT, 0);
     lv_obj_set_pos(s_status, 0, 7);
-    lv_label_set_text(s_status, "Ready");
+    lv_label_set_text(s_status, "Connecting...");   // not ready until WiFi is up + boot sets IDLE_HINT
 
     s_chat = lv_obj_create(scr);
     lv_obj_remove_style_all(s_chat);
@@ -180,6 +184,21 @@ esp_err_t chat_ui_init(void)
     lv_obj_add_event_cb(s_chat, chat_ui_activity_evt_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(scr,    chat_ui_activity_evt_cb, LV_EVENT_PRESSING, NULL);
     lv_obj_add_event_cb(scr,    chat_ui_activity_evt_cb, LV_EVENT_RELEASED, NULL);
+
+    // Touch-to-talk: long-press anywhere → start a turn, release → stop. Registered on BOTH the root
+    // (presses over the blank/status area) AND the chat list (which covers most of the screen — a press
+    // there goes to s_chat and does NOT bubble to scr). A drag on the chat still scrolls, because LVGL
+    // suppresses LONG_PRESSED once a scroll begins; a still hold fires it.
+    lv_obj_add_event_cb(scr,    chat_ui_talk_evt_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(scr,    chat_ui_talk_evt_cb, LV_EVENT_RELEASED,     NULL);
+    lv_obj_add_event_cb(s_chat, chat_ui_talk_evt_cb, LV_EVENT_LONG_PRESSED, NULL);
+    lv_obj_add_event_cb(s_chat, chat_ui_talk_evt_cb, LV_EVENT_RELEASED,     NULL);
+
+    // Raise the touch scroll threshold so a STILL hold (with the few px of capacitive jitter) over the
+    // scrollable chat isn't read as a scroll — which would cancel the long-press. A deliberate drag
+    // (> this many px) still scrolls. Default is 10; 30 reliably distinguishes hold-to-talk from scroll.
+    lv_indev_t *indev = lv_indev_get_next(NULL);
+    if (indev && indev->driver) indev->driver->scroll_limit = 30;
 
     bsp_display_unlock();
     bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
@@ -357,22 +376,48 @@ uint32_t chat_ui_touch_idle_ms(void)
 static chat_ui_power_cb s_power_cb;
 void chat_ui_set_power_cb(chat_ui_power_cb cb) { s_power_cb = cb; }
 
+// Touch-to-talk: long-press the screen → cb(1) (start), release → cb(0) (stop). s_talk_armed gates the
+// release so a quick tap (no preceding long-press) doesn't fire a spurious stop. Runs in the LVGL task
+// with the display lock already held, so it only flips flags + calls the (non-blocking) app callback.
+static chat_ui_talk_cb s_talk_cb;
+static void           *s_talk_ctx;
+static bool            s_talk_armed;
+void chat_ui_set_talk_cb(chat_ui_talk_cb cb, void *ctx) { s_talk_cb = cb; s_talk_ctx = ctx; }
+
+static void chat_ui_talk_evt_cb(lv_event_t *e)
+{
+    if (s_alarm_active) return;                       // a ringing timer owns the screen (tap-to-dismiss)
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code == LV_EVENT_LONG_PRESSED) {
+        if (s_talk_armed) return;                    // already armed (e.g. both scr + s_chat fired) → once
+        ESP_LOGI(TAG, "touch-to-talk: hold");
+        s_talk_armed = true;
+        if (s_talk_cb) s_talk_cb(1, s_talk_ctx);     // hold start → like a BOOT down
+    } else if (code == LV_EVENT_RELEASED) {
+        if (s_talk_armed && s_talk_cb) s_talk_cb(0, s_talk_ctx);   // release → stop + run
+        s_talk_armed = false;
+    }
+}
+
+// PWR (AXP2101 PWRKEY) short-press hook (used for volume down). Polled by screen_power_task.
+static chat_ui_pwrkey_cb s_pwrkey_cb;
+void chat_ui_set_pwrkey_cb(chat_ui_pwrkey_cb cb) { s_pwrkey_cb = cb; }
+
 static void screen_power_task(void *arg)
 {
     chat_ui_note_activity();
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(SCREEN_POLL_MS));
 
-        // PWR (AXP2101 PWRKEY) short press TOGGLES the screen: when off it wakes; when on it forces
-        // off immediately, without waiting out the idle timeout. A forced-off screen stays off until
-        // activity *newer* than the press arrives (touch / PWR tap / UI) — so the press itself, and
-        // any touch just before it, don't re-wake it.
+        // PWR (AXP2101 PWRKEY) short press → volume down (repurposed from the old screen toggle). It
+        // also wakes the display, like any other input. A long PWR hold still powers the device off
+        // (AXP2101 hardware). The screen now only blanks via the idle timeout (auto-off).
         bool pwr = device_power_key_short_press();   // always consume so the latch can't fire post-alarm
         if (s_alarm_active) continue;                // a ringing timer owns the screen (brightness flash +
                                                      // tap-to-dismiss run in timer_alert_task); skip idle/PWR
         if (pwr) {
-            if (s_screen_on) { s_force_off_armed = true; s_force_off_ms = now_ms(); }
-            else             { s_force_off_armed = false; chat_ui_note_activity(); }
+            chat_ui_note_activity();                 // PWR press wakes the screen
+            if (s_pwrkey_cb) s_pwrkey_cb();          // → volume down
         }
 
         // Idle accounting is now driven entirely by s_last_activity_ms, which is stamped by every UI

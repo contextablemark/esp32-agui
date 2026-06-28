@@ -11,6 +11,7 @@
 #include "esp_timer.h"
 #include "driver/i2c_master.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
+#include "app_cfg.h"
 
 static const char *TAG = "device_tools";
 
@@ -147,6 +148,15 @@ bool device_tools_on_battery(void)
     return !(s1 & AXP_ST1_VBUS_GOOD);                // VBUS absent → on battery
 }
 
+// tts_voice → the configured Soniox TTS voice name (the assistant's own spoken voice), so the agent
+// knows how it sounds and can refer to it. Always present (defaults to Adrian, matching the TTS client).
+static void add_voice(cJSON *arr)
+{
+    char voice[APP_CFG_VAL_MAX];
+    if (!app_cfg_get(APP_CFG_TTS_VOICE, voice, sizeof voice)) strlcpy(voice, "Adrian", sizeof voice);
+    ctx_add(arr, "tts_voice", voice);
+}
+
 cJSON *device_context_build(void)
 {
     cJSON *arr = cJSON_CreateArray();
@@ -154,6 +164,7 @@ cJSON *device_context_build(void)
 
     add_local_time(arr);
     add_battery(arr);
+    add_voice(arr);
     // Next P5 increment appends here: device_motion (QMI8658).
 
     if (cJSON_GetArraySize(arr) == 0) {   // nothing to report yet → send no context

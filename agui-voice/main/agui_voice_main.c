@@ -90,9 +90,10 @@ static void on_turn(const char *text, void *ctx)             // Soniox endpoint 
 static bool s_assist_started;          // assistant bubble open for the current message?
 static bool s_run_error;               // run ended in error → keep the "Error" status visible
 
-#define TTS_TEXT_MAX 2048              // P-a: cap the buffered reply (well under Soniox's 5000-char frame)
-static char   s_tts_text[TTS_TEXT_MAX]; // whole reply accumulated across the turn → spoken at the end
+#define TTS_TEXT_MAX 2048              // cap the buffered reply (well under Soniox's 5000-char frame)
+static char   s_tts_text[TTS_TEXT_MAX]; // whole reply accumulated across the turn → batch fallback
 static size_t s_tts_len;
+static bool   s_tts_streaming;         // P-b: this turn opened a live TTS stream (feeds as deltas arrive)
 
 // P-c PTT barge-in: a press DURING a reply aborts it. s_responding is true for the whole
 // run_agent_turn (the gate ptt_down_cb checks to decide "this press is a barge-in"); s_aborting is the
@@ -135,7 +136,15 @@ static void h_text_delta(const char *d, void *c)
         s_assist_started = true;
     }
     chat_ui_append_assistant(d);
-    if (d && *d) {                           // accumulate the whole reply for batch TTS (P-a)
+    if (d && *d) {
+        // P-b: open a live TTS stream on the first speakable delta (this runs inside the AG-UI SSE read
+        // on ptt_task, so open() briefly stalls the SSE — lossless). If it can't open (e.g. concurrent-
+        // TLS OOM), s_tts_streaming stays false and we fall back to batch after the run.
+        if (!s_tts_streaming) {
+            if (soniox_tts_open() == ESP_OK) s_tts_streaming = true;
+        }
+        if (s_tts_streaming) soniox_tts_feed(d);
+        // Always also buffer the whole reply: the batch fallback for a delta-less / open-failed turn.
         size_t dl = strlen(d);
         if (s_tts_len + dl < sizeof s_tts_text) {
             memcpy(s_tts_text + s_tts_len, d, dl);
@@ -215,6 +224,7 @@ static void run_agent_turn(const char *text)
     s_run_error      = false;
     s_tts_len        = 0;
     s_tts_text[0]    = '\0';
+    s_tts_streaming  = false;                       // P-b: set true once h_text_delta opens a live stream
     chat_ui_status("Thinking...");
     agui_cfg_t acfg = { .endpoint = url, .auth_bearer = have_tok ? token : NULL, .thread_id = NULL };
     cJSON *tools    = device_tools_manifest();     // advertised on EVERY run (NULL ⇒ no tools)
@@ -261,12 +271,20 @@ static void run_agent_turn(const char *text)
     }
 
     cJSON_Delete(tools);                           // cJSON_Delete(NULL) is safe
-    if (s_aborting)  { s_responding = false; return; }  // barge-in: the new turn owns the UI — touch nothing
-    if (s_run_error) { s_responding = false; return; }  // error → keep "Error" up, don't speak
-    if (s_tts_len > 0) {                           // P-a: speak the whole buffered reply (batch TTS).
-        chat_ui_status("Speaking...");             // WSS opens now — the SSE is already closed (sequential TLS)
+    if (s_aborting || s_run_error) {               // barge-in or real error → tear down any live stream
+        if (s_tts_streaming) { soniox_tts_cancel(); soniox_tts_wait_drained(3000); }  // BIT_CANCEL → quick close + unlock
+        s_responding = false;
+        return;                                    // abort: new turn owns the UI; error: keep "Error" up
+    }
+    if (s_tts_streaming) {                          // P-b: the reply streamed live → finalize it
+        chat_ui_status("Speaking...");
+        soniox_tts_finish();                        // text_end:true ONCE for the whole turn
+        soniox_tts_wait_drained(30000);             // play out the tail (30 s no-audio stall cap, not total)
+        if (s_aborting) { s_responding = false; return; }  // barged in during the spoken tail
+    } else if (s_tts_len > 0) {                     // delta-less / streaming-open-failed → P-a batch fallback
+        chat_ui_status("Speaking...");
         tts_speak_reply(s_tts_text);
-        if (s_aborting) { s_responding = false; return; }  // barged in DURING playback → don't repaint idle
+        if (s_aborting) { s_responding = false; return; }
     }
     chat_ui_status(IDLE_HINT);                     // back to the idle prompt
     s_responding = false;
@@ -318,23 +336,33 @@ static void fill_tone(int16_t *buf, int freq, int ampl)
     }
 }
 
+static int s_spk_vol = -1;  // last out-vol set on s_spk (-1 = unknown / just (re)opened)
+static int s_tts_vol = 90;  // spoken-reply volume 0-100, set by the volume buttons, loaded from NVS at boot
+
 // Lazily bring up the speaker (once). Returns true if s_spk is open at 16k/16/mono. The speaker is a
 // second esp_codec_dev OUT handle that coexists with the always-open mic on the single ES8311 — both
-// MUST use the same 16k rate. lp_idle closes it; the next beep/TTS write reopens it here.
+// MUST use the same 16k rate. Opened on the first beep/TTS write and kept open (no idle codec-close now).
 static bool spk_ensure(void)
 {
     if (s_spk) return true;
     s_spk = bsp_audio_codec_speaker_init();                 // pa_pin = GPIO46, raised automatically
     if (!s_spk) { ESP_LOGW(TAG, "speaker init failed"); return false; }
-    esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);             // 0-100 index, NOT dB
     esp_codec_dev_sample_info_t fs = { .bits_per_sample = 16, .channel = 1, .sample_rate = BEEP_SR };
     if (esp_codec_dev_open(s_spk, &fs) != ESP_OK) {         // same 16k as the mic → full-duplex OK
         ESP_LOGW(TAG, "speaker open failed");
         s_spk = NULL;                                       // retry on the next call
         return false;
     }
+    s_spk_vol = -1;                                         // force the next user to set its volume
     ESP_LOGI(TAG, "speaker ready (16k mono)");
     return true;
+}
+
+// Set the shared speaker volume only when it actually changes (the beep + TTS want different levels;
+// avoids an I2C write per audio chunk). 0-100 index, NOT dB.
+static void spk_set_vol(int v)
+{
+    if (s_spk && v != s_spk_vol) { esp_codec_dev_set_out_vol(s_spk, v); s_spk_vol = v; }
 }
 
 // Lazily bring up the speaker (once) and play one precomputed tone. Blocks (~90 ms) until it is
@@ -346,38 +374,72 @@ static void play_beep(const int16_t *pcm)
         s_beep_ready = true;
     }
     if (!spk_ensure()) return;
+    spk_set_vol(BEEP_VOL);
     esp_codec_dev_write(s_spk, (int16_t *)pcm, BEEP_SAMPLES * sizeof(int16_t));   // API wants non-const
 }
 
 static void play_ptt_beep(void) { play_beep(s_cue_pcm); }   // PTT "go ahead" cue (existing call sites)
 
-// TTS PCM sink: the soniox_tts_client drain task hands decoded pcm_s16le (16k/mono) here. main owns
-// the single speaker handle, so TTS shares it with the beep + the low-power codec-close (no 2nd handle).
+// TTS PCM sink: the soniox_tts_client drain task hands decoded pcm_s16le (16k/mono) here — for both
+// streaming (P-b) and batch (P-a) replies. main owns the single speaker handle, so TTS shares it with
+// the beep + the low-power codec-close (no 2nd handle), and sets the louder spoken-reply volume here.
 static void tts_pcm_write(const void *pcm, size_t bytes)
 {
     if (!spk_ensure()) return;
+    spk_set_vol(s_tts_vol);                          // live: volume-button changes take effect next chunk
     esp_codec_dev_write(s_spk, (void *)pcm, bytes);
 }
 
-#define TTS_VOL 90      // spoken replies louder than the subtle PTT beep (BEEP_VOL); 0-100 index, NOT dB
-// Speak a full reply at TTS volume, restoring the beep volume afterward so the next PTT cue / alarm
-// (which share s_spk) keep their tuned loudness.
-static void tts_speak_reply(const char *text)
+// Batch fallback used when streaming didn't open (delta-less / open-failed run). Volume is handled by
+// the sink (tts_pcm_write), so this is just the blocking speak.
+static void tts_speak_reply(const char *text) { soniox_tts_speak(text); }
+
+// --- Volume control -----------------------------------------------------------------------------
+// BOOT single-click = volume up, PWR short-press = volume down. The button/PWR callbacks just bump
+// s_tts_vol (a plain int) so it takes effect LIVE — the TTS drain task reads it every chunk via
+// tts_pcm_write, so you can turn a too-loud reply down mid-sentence. They also enqueue ev=3/4 to
+// ptt_task for the non-time-critical feedback (a tick at the new level + status + NVS persist).
+// Persisted so the level survives a power-cycle (the user powers off to save battery).
+#define VOL_STEP    10
+#define VOL_DEFAULT 90
+
+static void vol_bump(int delta)             // runs in a button/screen cb — int write only, non-blocking
 {
-    if (spk_ensure()) esp_codec_dev_set_out_vol(s_spk, TTS_VOL);
-    soniox_tts_speak(text);
-    if (s_spk) esp_codec_dev_set_out_vol(s_spk, BEEP_VOL);
+    int v = s_tts_vol + delta;
+    if (v < 0) v = 0; else if (v > 100) v = 100;
+    s_tts_vol = v;
+    chat_ui_note_activity();                // wake the display on a volume press
+    int e = delta > 0 ? 3 : 4;
+    xQueueSend(s_ptt_q, &e, 0);             // ptt_task: tick + status + persist
 }
 
-// --- Idle low-power: when the display is off AND on battery, shed WiFi + the codec/I2S and let the
-// CPU light-sleep --------------------------------------------------------------------------------
-// Driven by the chat_ui display-state hook. On battery-idle we (a) stop WiFi (radio off), (b) stop the
-// mic + speaker codec so the I2S releases its NO_LIGHT_SLEEP lock (a running I2S blocks light sleep),
-// and (c) release our own NO_LIGHT_SLEEP lock — so the CPU light-sleeps ONLY when WiFi+codec are both
-// off, which is exactly battery-idle (never with WiFi associated → no heap churn → STT stays safe).
-// On wake we reverse it. Plugged-in stays fully on. The set_timer still fires + rings (esp_timer wakes
-// the CPU; the alarm reopens the speaker lazily via play_beep, no WiFi). A PTT press wakes everything
-// then waits for the link. lp_idle/lp_wake are serialized by a mutex (called from screen + ptt tasks).
+// Play the short cue tone AT the current volume so the user hears the level (eyes-free). Task-context
+// only (shares s_spk); ptt_task calls it, never concurrently with a TTS reply (it's blocked then).
+static void play_vol_tick(void)
+{
+    if (!s_beep_ready) { fill_tone(s_cue_pcm, CUE_FREQ, CUE_AMPL); s_beep_ready = true; }
+    if (!spk_ensure()) return;
+    spk_set_vol(s_tts_vol);
+    esp_codec_dev_write(s_spk, s_cue_pcm, BEEP_SAMPLES * sizeof(int16_t));
+}
+
+static void vol_feedback(void)              // ptt_task ev=3/4 handler
+{
+    char s[24];
+    snprintf(s, sizeof s, "Volume: %d%%", s_tts_vol);
+    chat_ui_status(s);
+    play_vol_tick();
+    char val[8];
+    snprintf(val, sizeof val, "%d", s_tts_vol);
+    app_cfg_set(APP_CFG_TTS_VOL, val);      // persist (NVS); a few writes/session — negligible wear
+}
+
+// --- Idle low-power (RESTORED to the known-good d0dd24b9 config) --------------------------------
+// Removing this whole block broke the STT upload (transport_poll_write(0) / block-ack teardown) even on
+// good WiFi — the WiFi/TLS path depends on PM being configured with light_sleep_enable=true + the
+// NO_LIGHT_SLEEP lock HELD while active (released only on battery-idle). On battery-idle (display off)
+// lp_idle sheds WiFi + the codec and releases the lock so the CPU light-sleeps; lp_wake reverses it.
+// Plugged-in stays fully on (lp_idle is a no-op on USB), so no latency cost there.
 static volatile bool        s_lp_suspended;
 static SemaphoreHandle_t    s_lp_mutex;
 static esp_pm_lock_handle_t s_lp_lock;     // NO_LIGHT_SLEEP — HELD while active, released only when idle
@@ -397,12 +459,13 @@ static void lp_wake(void)   // bring WiFi + codec back if shed; exactly-once
 
 static void lp_idle(void)   // shed everything when idle — only on battery (plugged-in stays connected)
 {
-    if (!s_lp_mutex || s_lp_suspended || !device_tools_on_battery()) return;   // I2C read outside the mutex
+    // Never shed mid-response (a long spoken reply can outlast the 60 s screen-idle blank).
+    if (!s_lp_mutex || s_lp_suspended || s_responding || !device_tools_on_battery()) return;
     xSemaphoreTake(s_lp_mutex, portMAX_DELAY);
     if (!s_lp_suspended) {
         s_lp_suspended = true;
         soniox_client_mic_stop();                                // disable the mic I2S (RX)
-        if (s_spk) { esp_codec_dev_close(s_spk); s_spk = NULL; } // disable the speaker I2S (TX); reopens on next beep
+        if (s_spk) { esp_codec_dev_close(s_spk); s_spk = NULL; s_spk_vol = -1; } // disable the speaker I2S (TX)
         net_wifi_suspend();
         if (s_lp_lock) esp_pm_lock_release(s_lp_lock);           // WiFi+I2S now off → allow light sleep
     }
@@ -415,9 +478,6 @@ static void lp_set(bool display_on)   // chat_ui display-state hook (runs on the
     else            lp_idle();
 }
 
-// Configure PM for automatic light sleep + DFS, and take the NO_LIGHT_SLEEP lock (active at boot).
-// lp_idle releases it once WiFi+codec are off; lp_wake re-takes it. If PM isn't compiled in, the WiFi/
-// codec shedding still works (the lock is just NULL) — no light sleep, but no crash.
 static void power_mgmt_start(void)
 {
     s_lp_mutex = xSemaphoreCreateMutex();
@@ -441,7 +501,7 @@ static void ptt_task(void *arg)
             s_ptt_final[0] = '\0';
             s_ptt_run[0]   = '\0';
             s_listening = true;
-            lp_wake();                                 // woke from WiFi-off idle? bring the radio back…
+            lp_wake();                                 // woke from battery-idle? bring WiFi + codec back…
             if (!net_is_connected()) {                 // …and wait for the link before streaming to Soniox
                 chat_ui_status("Connecting...");
                 for (int i = 0; i < 100 && !net_is_connected(); i++) vTaskDelay(pdMS_TO_TICKS(50)); // ~5s
@@ -465,6 +525,12 @@ static void ptt_task(void *arg)
         } else if (ev == 0 && s_listening) {           // RELEASE
             s_listening = false;
             soniox_session_stop();                     // ws task is gone after this; buffers are stable
+            if (soniox_last_error()) {                 // STT upload/transport died (e.g. hotspot congestion)
+                ESP_LOGW(TAG, "STT failed: %s", soniox_last_error());
+                chat_ui_status("Network — hold to retry");   // don't silently drop the turn
+                net_low_latency(false);
+                continue;
+            }
             char turn[1024];
             snprintf(turn, sizeof turn, "%s%s", s_ptt_final, s_ptt_run);
             char *t = turn;                            // trim surrounding whitespace
@@ -484,6 +550,9 @@ static void ptt_task(void *arg)
             ESP_LOGI(TAG, "reconfigure: %s", saved ? "saved" : "timed out");
             if (saved) apply_timezone();   // P5: TZ may have changed in the portal
             chat_ui_status(IDLE_HINT);
+
+        } else if (ev == 3 || ev == 4) {           // VOLUME up/down feedback (s_tts_vol already bumped)
+            vol_feedback();                        // tick at the new level + "Volume: N%" + persist
         }
     }
 }
@@ -503,17 +572,38 @@ static void ptt_down_cb(void *btn, void *ctx)
 }
 static void ptt_up_cb(void *btn, void *ctx)   { chat_ui_note_activity(); int e = 0; xQueueSend(s_ptt_q, &e, 0); }  // release
 static void ptt_dbl_cb(void *btn, void *ctx)  { chat_ui_note_activity(); int e = 2; xQueueSend(s_ptt_q, &e, 0); }  // double-tap → setup
+static void ptt_vol_cb(void *btn, void *ctx)  { vol_bump(VOL_STEP); }    // BOOT single-click → volume UP
+
+// Touch-to-talk (eyes-free): long-press anywhere on the screen → same as a BOOT hold. Fires from the
+// LVGL task (display lock held) via chat_ui_set_talk_cb, so it only flips flags + enqueues (the same
+// non-blocking contract as the button cbs). ev: 1 = hold start, 0 = release.
+static void talk_cb(int ev, void *ctx)
+{
+    chat_ui_note_activity();
+    if (ev == 1 && s_responding) {           // barge-in parity with the BOOT hold
+        ESP_LOGI(TAG, "barge-in (touch): aborting active reply");
+        s_aborting = true;
+        agui_abort();
+        soniox_tts_cancel();
+    }
+    int e = ev; xQueueSend(s_ptt_q, &e, 0);
+}
+
+// PWR (AXP2101 PWRKEY) short press → volume DOWN. Fires from chat_ui's screen-power task.
+static void pwr_vol_cb(void) { vol_bump(-VOL_STEP); }
 
 static esp_err_t ptt_button_init(void)
 {
-    // Hold (>= long_press_time) = talk; a quick tap or double-tap does NOT start a turn, so a
-    // double-tap can open the setup portal without colliding with hold-to-talk.
+    // BOOT: a quick TAP = volume up; a HOLD (>= long_press_time) = push-to-talk (fallback to the
+    // touchscreen invoke); a DOUBLE-tap = setup portal. SINGLE_CLICK waits out the double-click window,
+    // so a double-tap fires the portal only (no stray volume bump).
     button_config_t bcfg = { .long_press_time = 300 };
     button_gpio_config_t gcfg = { .gpio_num = PTT_GPIO, .active_level = 0 };   // BOOT pulls GPIO0 low
     button_handle_t btn;
     esp_err_t err = iot_button_new_gpio_device(&bcfg, &gcfg, &btn);
     if (err != ESP_OK) return err;
-    iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, NULL, ptt_down_cb, NULL);  // hold → start
+    iot_button_register_cb(btn, BUTTON_SINGLE_CLICK,     NULL, ptt_vol_cb,  NULL);  // tap → volume up
+    iot_button_register_cb(btn, BUTTON_LONG_PRESS_START, NULL, ptt_down_cb, NULL);  // hold → talk (fallback)
     iot_button_register_cb(btn, BUTTON_PRESS_UP,         NULL, ptt_up_cb,   NULL);  // release → stop + run
     iot_button_register_cb(btn, BUTTON_DOUBLE_CLICK,     NULL, ptt_dbl_cb,  NULL);  // double-tap → setup portal
     return ESP_OK;
@@ -622,19 +712,24 @@ void app_main(void)
     if (soniox_client_init() != ESP_OK) ESP_LOGE(TAG, "mic init failed");
     if (soniox_tts_init(tts_pcm_write) != ESP_OK) ESP_LOGE(TAG, "tts init failed");  // P-a: spoken replies
 
+    // Spoken-reply volume from NVS (set by the volume buttons); default VOL_DEFAULT if unset.
+    { char v[8]; if (app_cfg_get(APP_CFG_TTS_VOL, v, sizeof v)) { int n = atoi(v); if (n >= 0 && n <= 100) s_tts_vol = n; } }
+
     power_mgmt_start();   // low-power: light sleep when idle (creates the lp mutex before ptt_task uses it)
 
-    // P3: BOOT-button push-to-talk.
-    s_ptt_q = xQueueCreate(4, sizeof(int));
+    // Push-to-talk: long-press the SCREEN (eyes-free) or hold BOOT. BOOT tap = vol up, PWR = vol down.
+    s_ptt_q = xQueueCreate(8, sizeof(int));
     // agui_run runs on this stack: TLS handshake + the C++ SDK (nlohmann JSON serialize/parse is
     // recursive + C++ exception unwinding), so it needs more headroom than the old cJSON path.
     xTaskCreate(ptt_task, "ptt", 16384, NULL, 5, NULL);
     xTaskCreate(timer_alert_task, "tmralert", 4096, NULL, 3, NULL);   // P7: surface set_timer firings
     if (ptt_button_init() != ESP_OK) ESP_LOGE(TAG, "PTT button init failed");
     chat_ui_status(IDLE_HINT);
-    chat_ui_set_power_cb(lp_set);       // low-power: shed WiFi when the display blanks (on battery), restore on wake
+    chat_ui_set_talk_cb(talk_cb, NULL);    // touch-to-talk: long-press the screen → start/stop a turn
+    chat_ui_set_pwrkey_cb(pwr_vol_cb);     // PWR short-press → volume down
+    chat_ui_set_power_cb(lp_set);          // low-power: shed WiFi+codec when the display blanks (on battery)
     chat_ui_screen_power_start(60);    // power saver: blank the AMOLED after 60s idle; wake on touch / PWR key / activity
-    ESP_LOGI(TAG, "ready — hold BOOT (GPIO0) to talk");
+    ESP_LOGI(TAG, "ready — long-press the screen or hold BOOT to talk");
 
     // Heartbeat: link + heap (internal RAM is the scarce one with the display).
     char ip[16];

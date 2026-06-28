@@ -165,8 +165,9 @@ esp_err_t net_prov_init(void)
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
-    // Idle in power-saving modem-sleep; net_low_latency(true) flips this off for the duration
-    // of a turn (modem sleep adds ~100ms/round-trip and throttles the Soniox upload).
+    // Idle in power-saving modem-sleep; net_low_latency(true) flips this to WIFI_PS_NONE for the
+    // duration of a turn. The MIN_MODEM->NONE flip at turn-start re-initializes the link (re-arms the
+    // block-ack session) — keeping it permanently NONE degraded the upload (DELBA storms → upload stall).
     ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));
 
     const esp_timer_create_args_t targs = { .callback = reconnect_cb, .name = "net_reconnect" };
@@ -225,7 +226,8 @@ void net_start_auto_reconnect(void)
 
 void net_low_latency(bool on)
 {
-    // Idempotent; safe to call repeatedly. esp_wifi_set_ps applies at runtime once WiFi is started.
+    // NONE for the whole turn (mic upload + agent reply) — and the flip itself re-arms the link;
+    // MIN_MODEM between turns. Idempotent; applies at runtime once WiFi is started.
     esp_wifi_set_ps(on ? WIFI_PS_NONE : WIFI_PS_MIN_MODEM);
 }
 
@@ -244,7 +246,7 @@ void net_wifi_suspend(void)
 void net_wifi_resume(void)
 {
     s_backoff_ms = BACKOFF_MIN_MS;
-    if (esp_wifi_start() == ESP_OK) esp_wifi_set_ps(WIFI_PS_MIN_MODEM);   // radio on; restore idle PS
+    if (esp_wifi_start() == ESP_OK) esp_wifi_set_ps(WIFI_PS_NONE);   // radio on; keep low-latency PS
     s_auto = true;
     esp_wifi_connect();                   // re-associate (async; net_is_connected() flips true on GOT_IP)
     ESP_LOGI(TAG, "wifi resuming (reconnecting)");

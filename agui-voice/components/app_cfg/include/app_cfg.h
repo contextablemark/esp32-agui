@@ -14,6 +14,8 @@ extern "C" {
 #define APP_CFG_AGUI_URL   "agui_url"     // AG-UI endpoint (P2)
 #define APP_CFG_AGUI_TOKEN "agui_token"   // AG-UI bearer (P2)
 #define APP_CFG_TZ         "tz"           // POSIX TZ string for local_time context (P5; default UTC0)
+#define APP_CFG_TTS_VOICE  "tts_voice"    // Soniox TTS voice name (P8; default "Adrian")
+#define APP_CFG_TTS_VOL    "tts_vol"      // spoken-reply volume 0-100 (volume buttons; default 90)
 
 // Max stored value length (incl. NUL). One number shared by the portal form, the NVS
 // writer, and every reader so a long value can't pass provisioning then fail to load.

@@ -47,6 +47,20 @@ static const char FORM_HEAD[] =
     "<label>AG-UI bearer token (optional)</label><input name=agui_token>"
     "<label>Timezone</label><select name=tz>";
 // ... TZ_OPTIONS injected here ...
+// Closes the timezone <select> and opens the TTS-voice <select>. The voice <option>s are emitted
+// between this and FORM_TAIL by root_get(), with the saved voice marked selected.
+static const char FORM_MID[] =
+    "</select>"
+    "<label>TTS voice</label><select name=voice>";
+
+// Soniox tts-rt-v1 voices (https://soniox.com/docs/tts/concepts/voices). Adrian first = the default.
+static const char *const TTS_VOICES[] = {
+    "Adrian", "Maya", "Daniel", "Noah", "Nina", "Emma", "Jack", "Claire", "Grace", "Owen",
+    "Mina", "Kenji", "Rafael", "Mateo", "Lucia", "Sofia", "Oliver", "Arthur", "Isla", "Victoria",
+    "Cooper", "Mason", "Ruby", "Elise", "Arjun", "Rohan", "Priya", "Meera",
+};
+#define TTS_VOICE_DEFAULT "Adrian"
+
 static const char FORM_TAIL[] =
     "</select>"
     "<p style='color:#666;font-size:.85em'>Timezone is auto-detected from your phone; change it if "
@@ -116,6 +130,18 @@ static esp_err_t root_get(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");   // always serve the current form (no stale cache)
     httpd_resp_send_chunk(req, FORM_HEAD, HTTPD_RESP_USE_STRLEN);
     httpd_resp_send_chunk(req, TZ_OPTIONS, HTTPD_RESP_USE_STRLEN);   // ~24 KB timezone <option> list
+    httpd_resp_send_chunk(req, FORM_MID, HTTPD_RESP_USE_STRLEN);     // close tz <select>, open voice <select>
+
+    // TTS-voice <option>s, pre-selecting the saved voice (so re-saving keeps it); default Adrian.
+    char saved[APP_CFG_VAL_MAX];
+    if (!app_cfg_get(APP_CFG_TTS_VOICE, saved, sizeof saved)) strlcpy(saved, TTS_VOICE_DEFAULT, sizeof saved);
+    char opts[1400];
+    size_t o = 0;
+    for (size_t i = 0; i < sizeof(TTS_VOICES) / sizeof(TTS_VOICES[0]); i++)
+        o += snprintf(opts + o, sizeof(opts) - o, "<option%s>%s</option>",
+                      strcmp(TTS_VOICES[i], saved) == 0 ? " selected" : "", TTS_VOICES[i]);
+    httpd_resp_send_chunk(req, opts, o);
+
     httpd_resp_send_chunk(req, FORM_TAIL, HTTPD_RESP_USE_STRLEN);
     return httpd_resp_send_chunk(req, NULL, 0);              // terminate the chunked response
 }
@@ -134,14 +160,16 @@ static esp_err_t save_post(httpd_req_t *req)
 
     char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
     char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0}, tz[64] = {0};
+    char voice[APP_CFG_VAL_MAX] = {0};
     bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
     bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
     bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
     bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
     bool have_tz     = form_field(body, "tz", tz, sizeof(tz)) && tz[0];
-    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d  (agui_url field in body=%d)",
-             got, have_ssid, have_soniox, have_url, have_token, have_tz, strstr(body, "agui_url=") != NULL);
-    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz) {
+    bool have_voice  = form_field(body, "voice", voice, sizeof(voice)) && voice[0];
+    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d voice=%d",
+             got, have_ssid, have_soniox, have_url, have_token, have_tz, have_voice);
+    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz && !have_voice) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -153,6 +181,7 @@ static esp_err_t save_post(httpd_req_t *req)
     if (have_url)    app_cfg_set(APP_CFG_AGUI_URL, agui_url);
     if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
     if (have_tz)     app_cfg_set(APP_CFG_TZ, tz);
+    if (have_voice)  app_cfg_set(APP_CFG_TTS_VOICE, voice);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -166,13 +195,15 @@ static esp_err_t save_post(httpd_req_t *req)
         "<li>AG-UI URL: <b>%s</b></li>"
         "<li>AG-UI token: <b>%s</b></li>"
         "<li>Timezone: <b>%s</b></li>"
+        "<li>TTS voice: <b>%s</b></li>"
         "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
         "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
         have_ssid ? "updated" : "unchanged",
         have_soniox ? "updated" : "unchanged",
         have_url ? agui_url : "unchanged",
         have_token ? "updated" : "unchanged",
-        have_tz ? tz : "unchanged");
+        have_tz ? tz : "unchanged",
+        have_voice ? voice : "unchanged");
     httpd_resp_sendstr(req, resp);
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
     return ESP_OK;

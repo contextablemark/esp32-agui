@@ -54,6 +54,17 @@ uint32_t chat_ui_touch_idle_ms(void);
 typedef void (*chat_ui_power_cb)(bool display_on);
 void     chat_ui_set_power_cb(chat_ui_power_cb cb);
 
+// Touch-to-talk hook: a long-press anywhere on the screen fires cb(1) (hold start); the release fires
+// cb(0) (stop). Mirrors a BOOT-button down/up so the app can drive the same PTT path. Runs in the LVGL
+// task with the display lock held — the callback MUST be non-blocking (no locks / I2C / waits).
+typedef void (*chat_ui_talk_cb)(int ev, void *ctx);   // ev: 1 = press (hold start), 0 = release
+void     chat_ui_set_talk_cb(chat_ui_talk_cb cb, void *ctx);
+
+// PWR-key hook: the AXP2101 PWRKEY short-press (polled by the screen-power task) fires this instead of
+// toggling the screen. Used for volume-down. Runs on the screen-power task — keep it non-blocking.
+typedef void (*chat_ui_pwrkey_cb)(void);
+void     chat_ui_set_pwrkey_cb(chat_ui_pwrkey_cb cb);
+
 // Interrupt prompt: build widgets from response_schema; answer returned via callback.
 typedef void (*chat_ui_answer_cb)(const cJSON *answer, void *ctx);
 void  chat_ui_prompt(const char *message, const cJSON *response_schema,
