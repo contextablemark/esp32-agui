@@ -443,6 +443,7 @@ static void vol_feedback(void)              // ptt_task ev=3/4 handler
 static volatile bool        s_lp_suspended;
 static SemaphoreHandle_t    s_lp_mutex;
 static esp_pm_lock_handle_t s_lp_lock;     // NO_LIGHT_SLEEP — HELD while active, released only when idle
+static esp_pm_lock_handle_t s_cpu_lock;    // CPU_FREQ_MAX  — HELD only for the duration of a turn (latency)
 
 static void lp_wake(void)   // bring WiFi + codec back if shed; exactly-once
 {
@@ -485,7 +486,20 @@ static void power_mgmt_start(void)
     if (esp_pm_configure(&pmc) != ESP_OK) { ESP_LOGW(TAG, "PM configure failed (CONFIG_PM_ENABLE?)"); return; }
     if (esp_pm_lock_create(ESP_PM_NO_LIGHT_SLEEP, 0, "active", &s_lp_lock) != ESP_OK) return;
     esp_pm_lock_acquire(s_lp_lock);   // active at boot → no light sleep until lp_idle releases it
+    // Latency: a CPU_FREQ_MAX lock acquired only for the span of a turn (turn_perf) so the 3 TLS
+    // handshakes (STT/AG-UI/TTS) + JSON parsing run at 240 MHz instead of ramping up from the 80 MHz
+    // DFS floor between network round-trips. NOT held at idle, so DFS still saves power between turns.
+    if (esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "turn", &s_cpu_lock) != ESP_OK)
+        ESP_LOGW(TAG, "PM: CPU_FREQ_MAX lock create failed (turns run at DFS speed)");
     ESP_LOGI(TAG, "PM: light sleep when idle (WiFi + codec off, on battery)");
+}
+
+// Full-throttle for the span of a turn: low-latency WiFi (PS=NONE) + CPU pinned to 240 MHz. Paired
+// 1:1 (one true at PRESS, one false on every turn-exit) so the counted PM lock can't drift.
+static void turn_perf(bool on)
+{
+    net_low_latency(on);
+    if (s_cpu_lock) { if (on) esp_pm_lock_acquire(s_cpu_lock); else esp_pm_lock_release(s_cpu_lock); }
 }
 
 // PTT state machine: press → open STT + stream; release → stop, assemble the utterance, run it.
@@ -512,13 +526,13 @@ static void ptt_task(void *arg)
                 ESP_LOGW(TAG, "wake: WiFi did not reconnect");
                 continue;
             }
-            net_low_latency(true);                     // low-latency WiFi for the whole turn (mic + reply)
+            turn_perf(true);                           // low-latency WiFi + 240 MHz CPU for the whole turn
             chat_ui_status("Listening...");
             play_ptt_beep();                           // "go ahead" cue; plays & returns before capture starts
             soniox_cfg_t scfg = { 0 };                 // api_key from NVS
             if (soniox_session_start(&scfg, on_partial, on_turn, NULL) != ESP_OK) {
                 s_listening = false;
-                net_low_latency(false);                // no turn will run; restore power-save now
+                turn_perf(false);                      // no turn will run; restore power-save now
                 chat_ui_status("STT error");
                 ESP_LOGE(TAG, "STT failed to start");
             }
@@ -528,7 +542,7 @@ static void ptt_task(void *arg)
             if (soniox_last_error()) {                 // STT upload/transport died (e.g. hotspot congestion)
                 ESP_LOGW(TAG, "STT failed: %s", soniox_last_error());
                 chat_ui_status("Network — hold to retry");   // don't silently drop the turn
-                net_low_latency(false);
+                turn_perf(false);
                 continue;
             }
             char turn[1024];
@@ -539,7 +553,7 @@ static void ptt_task(void *arg)
             while (n && (t[n-1] == ' ' || t[n-1] == '\t' || t[n-1] == '\n')) t[--n] = '\0';
             if (*t) run_agent_turn(t);             // owns its terminal status (idle hint / "Error")
             else    chat_ui_status(IDLE_HINT);
-            net_low_latency(false);                // turn done (reply streamed) → back to power-save
+            turn_perf(false);                      // turn done (reply streamed) → back to power-save
 
         } else if (ev == 2 && !s_listening) {      // DOUBLE-TAP → reopen setup portal (change endpoint etc.)
             chat_ui_status("Setup: join 'AMOLED-setup'");
