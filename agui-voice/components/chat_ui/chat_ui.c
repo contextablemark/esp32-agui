@@ -12,6 +12,7 @@
 #include "esp_timer.h"
 #include "bsp/esp32_s3_touch_amoled_1_8.h"
 #include "device_tools.h"
+#include "alarm_img.h"
 #include "lvgl.h"
 
 static const char *TAG = "chat_ui";
@@ -293,12 +294,16 @@ void chat_ui_clear_status(void) { chat_ui_status("Ready"); }
 // read never runs under the LVGL lock. This is distinct from chat_ui_idle_timer (the set_timer
 // countdown shown on the idle screen), below.
 static uint32_t          s_idle_timeout_ms = SCREEN_IDLE_TIMEOUT_MS;
+static bool              s_idle_disabled;               // "always on": never blank (configured timeout 0)
 static bool              s_screen_on = true;
 static bool              s_force_off_armed;             // PWR-tapped off; stays off until newer activity
 static uint32_t          s_force_off_ms;                // when the force-off press happened
 static volatile bool     s_alarm_active;                // a timer is ringing → it owns the screen
-static lv_obj_t         *s_alarm_overlay;               // full-screen black + red ring shown while ringing
-static lv_obj_t         *s_alarm_ring;                  // the red ring (toggled hidden/visible to flash)
+static lv_obj_t         *s_alarm_overlay;               // full-screen black overlay shown while ringing
+static lv_obj_t         *s_alarm_ring;                  // default graphic: red ring (toggled to flash)
+static lv_obj_t         *s_alarm_img;                   // user graphic (if uploaded): pulsed via img_opa
+static lv_img_dsc_t      s_alarm_img_dsc;               // descriptor over s_alarm_img_buf (must persist)
+static uint8_t          *s_alarm_img_buf;               // RGB565 pixels in PSRAM (freed on alarm off)
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 
@@ -317,17 +322,35 @@ void chat_ui_alarm_set(bool on)
                 lv_obj_set_style_bg_color(s_alarm_overlay, lv_color_black(), 0);
                 lv_obj_set_style_bg_opa(s_alarm_overlay, LV_OPA_COVER, 0);
                 lv_obj_clear_flag(s_alarm_overlay, LV_OBJ_FLAG_SCROLLABLE);
-                lv_obj_t *ring = lv_obj_create(s_alarm_overlay);     // outline-only circle (no fill)
-                lv_obj_remove_style_all(ring);
-                lv_obj_set_size(ring, 220, 220);
-                lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-                lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
-                lv_obj_set_style_border_color(ring, lv_color_hex(0xFF2222), 0);
-                lv_obj_set_style_border_width(ring, 14, 0);
-                lv_obj_center(ring);
-                lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
-                lv_obj_add_flag(ring, LV_OBJ_FLAG_HIDDEN);           // start dark; flash reveals it
-                s_alarm_ring = ring;
+
+                // A user-uploaded graphic (flash) wins; otherwise the built-in red ring. The image is
+                // RGB565 in PSRAM, shown centered on black and pulsed via img_opa with the beeps.
+                if (alarm_img_present() && alarm_img_load(&s_alarm_img_buf) == ESP_OK) {
+                    s_alarm_img_dsc.header.always_zero = 0;
+                    s_alarm_img_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+                    s_alarm_img_dsc.header.w  = ALARM_IMG_W;
+                    s_alarm_img_dsc.header.h  = ALARM_IMG_H;
+                    s_alarm_img_dsc.data_size = ALARM_IMG_BYTES;
+                    s_alarm_img_dsc.data      = s_alarm_img_buf;
+                    lv_obj_t *img = lv_img_create(s_alarm_overlay);
+                    lv_img_set_src(img, &s_alarm_img_dsc);
+                    lv_obj_center(img);
+                    lv_obj_clear_flag(img, LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_set_style_img_opa(img, LV_OPA_30, 0);     // start dimmed; flash pulses it bright
+                    s_alarm_img = img;
+                } else {
+                    lv_obj_t *ring = lv_obj_create(s_alarm_overlay); // outline-only circle (no fill)
+                    lv_obj_remove_style_all(ring);
+                    lv_obj_set_size(ring, 220, 220);
+                    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
+                    lv_obj_set_style_bg_opa(ring, LV_OPA_TRANSP, 0);
+                    lv_obj_set_style_border_color(ring, lv_color_hex(0xFF2222), 0);
+                    lv_obj_set_style_border_width(ring, 14, 0);
+                    lv_obj_center(ring);
+                    lv_obj_clear_flag(ring, LV_OBJ_FLAG_SCROLLABLE);
+                    lv_obj_add_flag(ring, LV_OBJ_FLAG_HIDDEN);       // start dark; flash reveals it
+                    s_alarm_ring = ring;
+                }
             }
             bsp_display_unlock();
         }
@@ -339,7 +362,11 @@ void chat_ui_alarm_set(bool on)
     } else {
         s_alarm_active = false;
         if (bsp_display_lock(1000)) {
-            if (s_alarm_overlay) { lv_obj_del(s_alarm_overlay); s_alarm_overlay = NULL; s_alarm_ring = NULL; }
+            if (s_alarm_overlay) {                         // deletes children (ring/img) too
+                lv_obj_del(s_alarm_overlay);
+                s_alarm_overlay = NULL; s_alarm_ring = NULL; s_alarm_img = NULL;
+            }
+            if (s_alarm_img_buf) { alarm_img_free(s_alarm_img_buf); s_alarm_img_buf = NULL; }  // after del → no live draw
             bsp_display_unlock();
         }
         s_screen_on = true;             // alarm ended: screen is on, resync the saver
@@ -354,9 +381,12 @@ void chat_ui_alarm_set(bool on)
 // for a full-screen brightness toggle. No-op if the alarm overlay isn't up. Called from the timer task.
 void chat_ui_alarm_flash(bool on)
 {
-    if (!s_alarm_ring) return;
+    if (!s_alarm_ring && !s_alarm_img) return;
     if (bsp_display_lock(80)) {
-        if (s_alarm_ring) {                          // re-check under lock (teardown may have run)
+        if (s_alarm_img) {                           // user graphic: pulse opacity (never fully dark)
+            lv_obj_set_style_img_opa(s_alarm_img, on ? LV_OPA_COVER : LV_OPA_30, 0);
+            lv_obj_invalidate(s_alarm_img);
+        } else if (s_alarm_ring) {                   // default ring: hard flash (re-check under lock)
             if (on) lv_obj_clear_flag(s_alarm_ring, LV_OBJ_FLAG_HIDDEN);
             else    lv_obj_add_flag(s_alarm_ring, LV_OBJ_FLAG_HIDDEN);
             lv_obj_invalidate(s_alarm_ring);         // mark its 220x220 area dirty for the next flush
@@ -420,6 +450,17 @@ static void screen_power_task(void *arg)
             if (s_pwrkey_cb) s_pwrkey_cb();          // → volume down
         }
 
+        // "Always on" (configured timeout = 0): never blank. Keep the panel lit (re-light it if it
+        // had been off before the setting changed) and skip all idle accounting below.
+        if (s_idle_disabled) {
+            if (!s_screen_on) {
+                s_screen_on = true;
+                bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
+                if (s_power_cb) s_power_cb(true);
+            }
+            continue;
+        }
+
         // Idle accounting is now driven entirely by s_last_activity_ms, which is stamped by every UI
         // mutation, PTT/PWR press, AND every touch/scroll event (chat_ui_activity_evt_cb, installed in
         // chat_ui_init). So we no longer read lv_disp_get_inactive_time under the LVGL lock — that read
@@ -457,15 +498,28 @@ static void screen_power_task(void *arg)
     }
 }
 
+void chat_ui_set_screen_timeout_s(int seconds)
+{
+    if (seconds <= 0) {                                // 0 = always on (never blank)
+        s_idle_disabled = true;
+    } else {
+        s_idle_disabled = false;
+        s_idle_timeout_ms = (uint32_t)seconds * 1000;
+    }
+}
+
 void chat_ui_screen_power_start(int idle_timeout_s)
 {
-    if (idle_timeout_s > 0) s_idle_timeout_ms = (uint32_t)idle_timeout_s * 1000;
+    chat_ui_set_screen_timeout_s(idle_timeout_s);      // 0 = always on; >0 = blank after N seconds
     chat_ui_note_activity();
     s_screen_on = true;
     s_force_off_armed = false;
     xTaskCreate(screen_power_task, "scrnpwr", 4096, NULL, 3, NULL);
-    ESP_LOGI(TAG, "screen-power saver: blank after %us idle (wake on touch / PWR key / activity)",
-             (unsigned)(s_idle_timeout_ms / 1000));
+    if (s_idle_disabled)
+        ESP_LOGI(TAG, "screen-power saver: always on (no auto-blank)");
+    else
+        ESP_LOGI(TAG, "screen-power saver: blank after %us idle (wake on touch / PWR key / activity)",
+                 (unsigned)(s_idle_timeout_ms / 1000));
 }
 
 // --- later phases ---

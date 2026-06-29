@@ -13,9 +13,11 @@
 #include "esp_wifi.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
 
 #include "tz_options.h"   // auto-generated <option> list: IANA label -> POSIX TZ value
+#include "alarm_img.h"    // configurable alarm graphic stored in flash (POST /alarmimg)
 
 static const char *TAG = "net_portal";
 
@@ -62,7 +64,8 @@ static const char *const TTS_VOICES[] = {
 #define TTS_VOICE_DEFAULT "Adrian"
 
 static const char FORM_TAIL[] =
-    "</select>"
+    // NB: the voice <select> is closed by root_get's dynamic chunk (which also emits the screen-timeout
+    // field pre-filled with the saved value), so FORM_TAIL no longer opens with "</select>".
     "<p style='color:#666;font-size:.85em'>Timezone is auto-detected from your phone; change it if "
     "needed. Leave WiFi blank if already connected; fill the Soniox key to enable voice and the "
     "AG-UI URL to enable the agent.</p>"
@@ -70,7 +73,34 @@ static const char FORM_TAIL[] =
     "<script>try{var z=Intl.DateTimeFormat().resolvedOptions().timeZone,"
     "s=document.querySelector('select[name=tz]');"
     "for(var i=0;i<s.options.length;i++){if(s.options[i].text===z){s.selectedIndex=i;break;}}}"
-    "catch(e){}</script></body></html>";
+    "catch(e){}</script>"
+    // Alarm graphic: any image, cropped in-browser to 240x240 and converted to RGB565 (high byte
+    // first, matching the device's LV_COLOR_16_SWAP) so the device stores the raw bytes with no decode.
+    "<hr><h3>Alarm image (optional)</h3>"
+    "<p style='color:#666;font-size:.85em'>Shown when a timer goes off. Any image - it's cropped to "
+    "a 240x240 square (preview below) and sent to the device.</p>"
+    "<input type=file id=aimg accept='image/*'>"
+    "<canvas id=acv width=240 height=240 style='width:120px;height:120px;border:1px solid #ccc;"
+    "background:#000;display:block;margin:.4em 0'></canvas>"
+    "<button id=asend type=button disabled>Upload alarm image</button>"
+    "<span id=astat style='margin-left:.6em'></span>"
+    "<script>(function(){"
+    "var f=document.getElementById('aimg'),cv=document.getElementById('acv'),"
+    "b=document.getElementById('asend'),st=document.getElementById('astat'),W=240,H=240;"
+    "f.onchange=function(){var fi=f.files[0];if(!fi)return;var im=new Image();"
+    "im.onload=function(){var c=cv.getContext('2d'),s=Math.max(W/im.width,H/im.height),"
+    "w=im.width*s,h=im.height*s;c.fillStyle='#000';c.fillRect(0,0,W,H);"
+    "c.drawImage(im,(W-w)/2,(H-h)/2,w,h);b.disabled=false;st.textContent='';"
+    "URL.revokeObjectURL(im.src);};im.src=URL.createObjectURL(fi);};"
+    "b.onclick=function(){var c=cv.getContext('2d'),d=c.getImageData(0,0,W,H).data,"
+    "o=new Uint8Array(W*H*2),j=0,i,v;"
+    "for(i=0;i<d.length;i+=4){v=((d[i]>>3)<<11)|((d[i+1]>>2)<<5)|(d[i+2]>>3);"
+    "o[j++]=v>>8;o[j++]=v&255;}"
+    "b.disabled=true;st.textContent='Uploading...';"
+    "fetch('/alarmimg',{method:'POST',headers:{'Content-Type':'application/octet-stream'},body:o})"
+    ".then(function(r){st.textContent=r.ok?'Saved':'Failed';b.disabled=false;})"
+    ".catch(function(){st.textContent='Failed';b.disabled=false;});};"
+    "})();</script></body></html>";
 
 // ---- tiny form helpers ---------------------------------------------------
 
@@ -135,11 +165,20 @@ static esp_err_t root_get(httpd_req_t *req)
     // TTS-voice <option>s, pre-selecting the saved voice (so re-saving keeps it); default Adrian.
     char saved[APP_CFG_VAL_MAX];
     if (!app_cfg_get(APP_CFG_TTS_VOICE, saved, sizeof saved)) strlcpy(saved, TTS_VOICE_DEFAULT, sizeof saved);
-    char opts[1400];
+    char opts[1500];
     size_t o = 0;
     for (size_t i = 0; i < sizeof(TTS_VOICES) / sizeof(TTS_VOICES[0]); i++)
         o += snprintf(opts + o, sizeof(opts) - o, "<option%s>%s</option>",
                       strcmp(TTS_VOICES[i], saved) == 0 ? " selected" : "", TTS_VOICES[i]);
+
+    // Close the voice <select>, then the screen-timeout field, pre-filled with the saved value (so
+    // re-saving keeps it). Default 60 s; 0 = always on.
+    char scr_to[8];
+    if (!app_cfg_get(APP_CFG_SCREEN_TO, scr_to, sizeof scr_to)) strlcpy(scr_to, "60", sizeof scr_to);
+    o += snprintf(opts + o, sizeof(opts) - o,
+                  "</select>"
+                  "<label>Screen blank timeout (seconds, 0 = always on)</label>"
+                  "<input name=scr_to type=number min=0 max=86400 value='%s'>", scr_to);
     httpd_resp_send_chunk(req, opts, o);
 
     httpd_resp_send_chunk(req, FORM_TAIL, HTTPD_RESP_USE_STRLEN);
@@ -160,16 +199,17 @@ static esp_err_t save_post(httpd_req_t *req)
 
     char ssid[33] = {0}, pass[65] = {0}, soniox[APP_CFG_VAL_MAX] = {0};
     char agui_url[APP_CFG_VAL_MAX] = {0}, agui_token[APP_CFG_VAL_MAX] = {0}, tz[64] = {0};
-    char voice[APP_CFG_VAL_MAX] = {0};
+    char voice[APP_CFG_VAL_MAX] = {0}, scr_to[8] = {0};
     bool have_ssid   = form_field(body, "ssid", ssid, sizeof(ssid)) && ssid[0];
     bool have_soniox = form_field(body, "soniox", soniox, sizeof(soniox)) && soniox[0];
     bool have_url    = form_field(body, "agui_url", agui_url, sizeof(agui_url)) && agui_url[0];
     bool have_token  = form_field(body, "agui_token", agui_token, sizeof(agui_token)) && agui_token[0];
     bool have_tz     = form_field(body, "tz", tz, sizeof(tz)) && tz[0];
     bool have_voice  = form_field(body, "voice", voice, sizeof(voice)) && voice[0];
-    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d voice=%d",
-             got, have_ssid, have_soniox, have_url, have_token, have_tz, have_voice);
-    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz && !have_voice) {
+    bool have_scr    = form_field(body, "scr_to", scr_to, sizeof(scr_to)) && scr_to[0];
+    ESP_LOGI(TAG, "save: body=%dB  ssid=%d soniox=%d url=%d token=%d tz=%d voice=%d scr=%d",
+             got, have_ssid, have_soniox, have_url, have_token, have_tz, have_voice, have_scr);
+    if (!have_ssid && !have_soniox && !have_url && !have_token && !have_tz && !have_voice && !have_scr) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "nothing to save");
         return ESP_FAIL;
     }
@@ -182,10 +222,22 @@ static esp_err_t save_post(httpd_req_t *req)
     if (have_token)  app_cfg_set(APP_CFG_AGUI_TOKEN, agui_token);
     if (have_tz)     app_cfg_set(APP_CFG_TZ, tz);
     if (have_voice)  app_cfg_set(APP_CFG_TTS_VOICE, voice);
+    if (have_scr) {                                  // clamp to [0, 86400] s, store the clamped value
+        int n = atoi(scr_to);
+        if (n < 0) n = 0;
+        if (n > 86400) n = 86400;
+        snprintf(scr_to, sizeof scr_to, "%d", n);
+        app_cfg_set(APP_CFG_SCREEN_TO, scr_to);
+    }
+
+    char scr_disp[16];
+    if (!have_scr)                strlcpy(scr_disp, "unchanged", sizeof scr_disp);
+    else if (atoi(scr_to) == 0)   strlcpy(scr_disp, "always on", sizeof scr_disp);
+    else                          snprintf(scr_disp, sizeof scr_disp, "%s s", scr_to);
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    static char resp[768];
+    static char resp[1024];
     snprintf(resp, sizeof resp,
         "<html><head><meta name=viewport content='width=device-width,initial-scale=1'></head>"
         "<body style='font-family:sans-serif;margin:2em'><h3>Saved</h3>"
@@ -196,6 +248,7 @@ static esp_err_t save_post(httpd_req_t *req)
         "<li>AG-UI token: <b>%s</b></li>"
         "<li>Timezone: <b>%s</b></li>"
         "<li>TTS voice: <b>%s</b></li>"
+        "<li>Screen timeout: <b>%s</b></li>"
         "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
         "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
         have_ssid ? "updated" : "unchanged",
@@ -203,9 +256,40 @@ static esp_err_t save_post(httpd_req_t *req)
         have_url ? agui_url : "unchanged",
         have_token ? "updated" : "unchanged",
         have_tz ? tz : "unchanged",
-        have_voice ? voice : "unchanged");
+        have_voice ? voice : "unchanged",
+        scr_disp);
     httpd_resp_sendstr(req, resp);
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
+    return ESP_OK;
+}
+
+// Binary upload of the alarm graphic: exactly ALARM_IMG_BYTES of RGB565 (the browser crops + converts).
+// Stream the body into a PSRAM buffer (keeps the tight internal heap free), then commit to flash.
+static esp_err_t alarmimg_post(httpd_req_t *req)
+{
+    if (req->content_len != ALARM_IMG_BYTES) {
+        ESP_LOGW(TAG, "alarmimg: wrong size %d (want %d)", req->content_len, (int)ALARM_IMG_BYTES);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "wrong image size");
+        return ESP_FAIL;
+    }
+    uint8_t *buf = heap_caps_malloc(ALARM_IMG_BYTES, MALLOC_CAP_SPIRAM);
+    if (!buf) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no mem"); return ESP_FAIL; }
+
+    int got = 0;
+    while (got < ALARM_IMG_BYTES) {
+        int r = httpd_req_recv(req, (char *)buf + got, ALARM_IMG_BYTES - got);
+        if (r <= 0) { heap_caps_free(buf); return ESP_FAIL; }
+        got += r;
+    }
+    esp_err_t e = alarm_img_write(buf, got);
+    heap_caps_free(buf);
+    if (e != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "write failed");
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "alarm image saved (%d B)", got);
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, "ok");
     return ESP_OK;
 }
 
@@ -280,9 +364,11 @@ esp_err_t net_portal_start(const char *ap_ssid)
     if (httpd_start(&s_httpd, &cfg) != ESP_OK) return ESP_FAIL;
     httpd_uri_t u_root = { .uri = "/", .method = HTTP_GET, .handler = root_get };
     httpd_uri_t u_save = { .uri = "/save", .method = HTTP_POST, .handler = save_post };
+    httpd_uri_t u_aimg = { .uri = "/alarmimg", .method = HTTP_POST, .handler = alarmimg_post };
     httpd_uri_t u_any  = { .uri = "/*", .method = HTTP_GET, .handler = redirect_get };
     httpd_register_uri_handler(s_httpd, &u_root);
     httpd_register_uri_handler(s_httpd, &u_save);
+    httpd_register_uri_handler(s_httpd, &u_aimg);
     httpd_register_uri_handler(s_httpd, &u_any);
 
     s_dns_run = true;

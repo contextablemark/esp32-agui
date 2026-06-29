@@ -3,3 +3,7 @@
 nvs,      data, nvs,     ,         0x6000,
 phy_init, data, phy,     ,         0x1000,
 factory,  app,  factory, ,         3M,
+# Configurable alarm graphic (240x240 RGB565 + header), uploaded via the captive portal.
+# Auto-placed right after factory (0x310000); fits the free space in the 4 MB layout and leaves
+# nvs/factory offsets unchanged, so a normal `idf.py flash` preserves saved WiFi/keys.
+alarmimg, data, 0x40,    ,         0x40000,

@@ -562,7 +562,14 @@ static void ptt_task(void *arg)
             bool saved = net_portal_wait_saved(180000);   // up to 3 min, then auto-close
             net_portal_stop();
             ESP_LOGI(TAG, "reconfigure: %s", saved ? "saved" : "timed out");
-            if (saved) apply_timezone();   // P5: TZ may have changed in the portal
+            if (saved) {
+                apply_timezone();          // P5: TZ may have changed in the portal
+                char v[8];                 // screen blank timeout may have changed → apply live (no reboot)
+                if (app_cfg_get(APP_CFG_SCREEN_TO, v, sizeof v)) {
+                    int n = atoi(v);
+                    if (n >= 0 && n <= 86400) chat_ui_set_screen_timeout_s(n);
+                }
+            }
             chat_ui_status(IDLE_HINT);
 
         } else if (ev == 3 || ev == 4) {           // VOLUME up/down feedback (s_tts_vol already bumped)
@@ -742,7 +749,9 @@ void app_main(void)
     chat_ui_set_talk_cb(talk_cb, NULL);    // touch-to-talk: long-press the screen → start/stop a turn
     chat_ui_set_pwrkey_cb(pwr_vol_cb);     // PWR short-press → volume down
     chat_ui_set_power_cb(lp_set);          // low-power: shed WiFi+codec when the display blanks (on battery)
-    chat_ui_screen_power_start(60);    // power saver: blank the AMOLED after 60s idle; wake on touch / PWR key / activity
+    // Screen blank timeout from NVS (captive portal): default 60 s, 0 = always on.
+    { char v[8]; int s = 60; if (app_cfg_get(APP_CFG_SCREEN_TO, v, sizeof v)) { int n = atoi(v); if (n >= 0 && n <= 86400) s = n; }
+      chat_ui_screen_power_start(s); }   // blank after s idle (wake on touch / PWR key / activity); 0 = always on
     ESP_LOGI(TAG, "ready — long-press the screen or hold BOOT to talk");
 
     // Heartbeat: link + heap (internal RAM is the scarce one with the display).
