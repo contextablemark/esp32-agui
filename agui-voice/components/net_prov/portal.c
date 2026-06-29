@@ -179,6 +179,16 @@ static esp_err_t root_get(httpd_req_t *req)
                   "</select>"
                   "<label>Screen blank timeout (seconds, 0 = always on)</label>"
                   "<input name=scr_to type=number min=0 max=86400 value='%s'>", scr_to);
+
+    // Idle-animation checkbox, pre-checked from the saved state (so re-saving keeps it). Inline style
+    // overrides the form's block/full-width input rule.
+    char ia[4];
+    bool ia_on = app_cfg_get(APP_CFG_IDLE_ANIM, ia, sizeof ia) && ia[0] == '1';
+    o += snprintf(opts + o, sizeof(opts) - o,
+                  "<label style='display:flex;align-items:center;gap:.5em;margin:.5em 0'>"
+                  "<input type=checkbox name=idle_anim value=1%s style='width:auto;display:inline;margin:0'>"
+                  " Idle animation (gently pulse the uploaded alarm image when idle)</label>",
+                  ia_on ? " checked" : "");
     httpd_resp_send_chunk(req, opts, o);
 
     httpd_resp_send_chunk(req, FORM_TAIL, HTTPD_RESP_USE_STRLEN);
@@ -229,11 +239,20 @@ static esp_err_t save_post(httpd_req_t *req)
         snprintf(scr_to, sizeof scr_to, "%d", n);
         app_cfg_set(APP_CFG_SCREEN_TO, scr_to);
     }
+    // Idle-animation checkbox: a checkbox is absent from the body when unchecked. Trust it only when
+    // our current form was submitted (scr_to is always in it) so a stale/foreign POST can't flip it.
+    bool ia_on = false;
+    if (have_scr) {
+        char tmp[4] = {0};
+        ia_on = form_field(body, "idle_anim", tmp, sizeof tmp);
+        app_cfg_set(APP_CFG_IDLE_ANIM, ia_on ? "1" : "0");
+    }
 
     char scr_disp[16];
     if (!have_scr)                strlcpy(scr_disp, "unchanged", sizeof scr_disp);
     else if (atoi(scr_to) == 0)   strlcpy(scr_disp, "always on", sizeof scr_disp);
     else                          snprintf(scr_disp, sizeof scr_disp, "%s s", scr_to);
+    const char *ia_disp = have_scr ? (ia_on ? "on" : "off") : "unchanged";
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
@@ -249,6 +268,7 @@ static esp_err_t save_post(httpd_req_t *req)
         "<li>Timezone: <b>%s</b></li>"
         "<li>TTS voice: <b>%s</b></li>"
         "<li>Screen timeout: <b>%s</b></li>"
+        "<li>Idle animation: <b>%s</b></li>"
         "</ul><p>If AG-UI URL says \"unchanged\" but you typed one, your phone submitted a cached "
         "form — reload <a href='http://192.168.4.1/'>192.168.4.1</a> and try again.</p></body></html>",
         have_ssid ? "updated" : "unchanged",
@@ -257,7 +277,7 @@ static esp_err_t save_post(httpd_req_t *req)
         have_token ? "updated" : "unchanged",
         have_tz ? tz : "unchanged",
         have_voice ? voice : "unchanged",
-        scr_disp);
+        scr_disp, ia_disp);
     httpd_resp_sendstr(req, resp);
     xEventGroupSetBits(s_portal_eg, PBIT_SAVED);
     return ESP_OK;

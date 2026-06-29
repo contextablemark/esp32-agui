@@ -569,6 +569,8 @@ static void ptt_task(void *arg)
                     int n = atoi(v);
                     if (n >= 0 && n <= 86400) chat_ui_set_screen_timeout_s(n);
                 }
+                char ia[4];                // idle-animation flag may have changed → apply live
+                chat_ui_set_idle_anim_enabled(app_cfg_get(APP_CFG_IDLE_ANIM, ia, sizeof ia) && ia[0] == '1');
             }
             chat_ui_status(IDLE_HINT);
 
@@ -752,6 +754,7 @@ void app_main(void)
     // Screen blank timeout from NVS (captive portal): default 60 s, 0 = always on.
     { char v[8]; int s = 60; if (app_cfg_get(APP_CFG_SCREEN_TO, v, sizeof v)) { int n = atoi(v); if (n >= 0 && n <= 86400) s = n; }
       chat_ui_screen_power_start(s); }   // blank after s idle (wake on touch / PWR key / activity); 0 = always on
+    { char v[4]; chat_ui_set_idle_anim_enabled(app_cfg_get(APP_CFG_IDLE_ANIM, v, sizeof v) && v[0] == '1'); }  // idle screensaver
     ESP_LOGI(TAG, "ready — long-press the screen or hold BOOT to talk");
 
     // Heartbeat: link + heap (internal RAM is the scarce one with the display).

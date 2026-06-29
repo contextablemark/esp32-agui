@@ -304,8 +304,84 @@ static lv_obj_t         *s_alarm_ring;                  // default graphic: red 
 static lv_obj_t         *s_alarm_img;                   // user graphic (if uploaded): pulsed via img_opa
 static lv_img_dsc_t      s_alarm_img_dsc;               // descriptor over s_alarm_img_buf (must persist)
 static uint8_t          *s_alarm_img_buf;               // RGB565 pixels in PSRAM (freed on alarm off)
+static lv_obj_t         *s_idle_overlay;                // screensaver: black overlay + pulsing image (idle)
+static lv_obj_t         *s_idle_img;
+static lv_img_dsc_t      s_idle_dsc;                    // descriptor over s_idle_buf (must persist)
+static uint8_t          *s_idle_buf;                    // RGB565 pixels in PSRAM (freed when saver stops)
+static bool              s_idle_anim_enabled;           // config (NVS): idle screensaver on/off
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
+
+// --- idle screensaver: gently pulse the uploaded image when idle (opt-in via the portal) ----------
+// Disabled by default. When enabled AND an alarm image is stored, the screen-power task shows this in
+// place of blanking: a centered image on black whose opacity LVGL animates — 5s blank, fade in 5s,
+// hold 5s, fade out 5s, repeat (a 20s cycle). The panel stays lit and the system stays awake (the
+// animation needs the CPU), so it deliberately does NOT trigger the battery light-sleep idle path.
+static void idle_anim_opa_cb(void *var, int32_t v)
+{
+    lv_obj_set_style_img_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+}
+
+static bool idle_anim_start(void)
+{
+    if (s_idle_overlay) return true;                         // already running
+    if (!alarm_img_present() || alarm_img_load(&s_idle_buf) != ESP_OK) return false;  // no image → blank instead
+    bool ok = false;
+    if (bsp_display_lock(1000)) {
+        s_idle_overlay = lv_obj_create(lv_scr_act());
+        lv_obj_remove_style_all(s_idle_overlay);
+        lv_obj_set_size(s_idle_overlay, lv_pct(100), lv_pct(100));
+        lv_obj_set_style_bg_color(s_idle_overlay, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(s_idle_overlay, LV_OPA_COVER, 0);
+        // Click-through + non-scrollable: a touch passes to the chat beneath (so touch-to-talk still
+        // works) and registers as input activity, which wakes the saver on the next screen-power tick.
+        lv_obj_clear_flag(s_idle_overlay, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+
+        s_idle_dsc.header.always_zero = 0;
+        s_idle_dsc.header.cf = LV_IMG_CF_TRUE_COLOR;
+        s_idle_dsc.header.w  = ALARM_IMG_W;
+        s_idle_dsc.header.h  = ALARM_IMG_H;
+        s_idle_dsc.data_size = ALARM_IMG_BYTES;
+        s_idle_dsc.data      = s_idle_buf;
+        s_idle_img = lv_img_create(s_idle_overlay);
+        lv_img_set_src(s_idle_img, &s_idle_dsc);
+        lv_obj_center(s_idle_img);
+        lv_obj_clear_flag(s_idle_img, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_style_img_opa(s_idle_img, LV_OPA_TRANSP, 0);  // start blank
+
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, s_idle_img);
+        lv_anim_set_exec_cb(&a, idle_anim_opa_cb);
+        lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);     // 0 → 255 opacity
+        lv_anim_set_delay(&a, 5000);                             // start blank 5 s (first cycle too)
+        lv_anim_set_time(&a, 5000);                              // fade in over 5 s
+        lv_anim_set_playback_delay(&a, 5000);                    // hold at full intensity 5 s
+        lv_anim_set_playback_time(&a, 5000);                     // fade out over 5 s
+        lv_anim_set_repeat_delay(&a, 5000);                      // blank 5 s, then repeat → 20 s cycle
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);       // calm, eased ramp
+        lv_anim_start(&a);
+        ok = true;
+        bsp_display_unlock();
+    }
+    if (!ok && s_idle_buf) { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }
+    return ok;
+}
+
+static void idle_anim_stop(void)
+{
+    if (!s_idle_overlay) return;
+    if (bsp_display_lock(1000)) {
+        lv_anim_del(s_idle_img, idle_anim_opa_cb);
+        lv_obj_del(s_idle_overlay);                             // deletes the img child too
+        s_idle_overlay = NULL; s_idle_img = NULL;
+        if (s_idle_buf) { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }  // after del → no live draw
+        bsp_display_unlock();
+    }
+}
+
+void chat_ui_set_idle_anim_enabled(bool enabled) { s_idle_anim_enabled = enabled; }
 
 // Enter/leave alarm mode. On: cover the UI with a black overlay holding a big red ring (outline) in
 // the center, and suspend the idle power-saver so the timer task can flash the panel in time with the
@@ -314,6 +390,7 @@ void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 void chat_ui_alarm_set(bool on)
 {
     if (on) {
+        idle_anim_stop();                            // a ringing timer replaces the idle screensaver
         if (bsp_display_lock(1000)) {
             if (!s_alarm_overlay) {
                 s_alarm_overlay = lv_obj_create(lv_scr_act());
@@ -477,9 +554,9 @@ static void screen_power_task(void *arg)
                 uint32_t ti = lv_disp_get_inactive_time(NULL);
                 bsp_display_unlock();
                 if (ti < (now - s_last_activity_ms)) s_last_activity_ms = now - ti;   // touch is newer
-            } else {
+            } else if (!s_idle_overlay) {
                 s_last_activity_ms = now;   // LVGL busy → treat as activity, never blank mid-render
-            }
+            }   // during the screensaver a failed peek just retries next tick (don't false-wake)
         }
         uint32_t act_age = now - s_last_activity_ms;                  // ms since last activity of any kind
         uint32_t idle = act_age;
@@ -489,11 +566,25 @@ static void screen_power_task(void *arg)
 
         bool want_on = s_force_off_armed ? false : (idle < s_idle_timeout_ms);
         if (want_on != s_screen_on) {
-            s_screen_on = want_on;
-            bsp_display_brightness_set(want_on ? SCREEN_ON_BRIGHTNESS : 0);
-            ESP_LOGI(TAG, "screen %s (idle=%ums%s)", want_on ? "on" : "off",
-                     (unsigned)idle, want_on ? "" : (s_force_off_armed ? ", PWR-off" : ""));
-            if (s_power_cb) s_power_cb(want_on);   // gate light sleep on display state
+            if (want_on) {                          // → on (woke from blank or screensaver)
+                idle_anim_stop();                   // remove the screensaver if it was showing
+                s_screen_on = true;
+                bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
+                ESP_LOGI(TAG, "screen on (idle=%ums)", (unsigned)idle);
+                if (s_power_cb) s_power_cb(true);   // back to active power state
+            } else if (s_idle_anim_enabled && idle_anim_start()) {
+                // Idle + screensaver enabled + image present: pulse the image instead of blanking. Keep
+                // the panel lit + the system awake (the animation needs the CPU) → no power_cb(false).
+                s_screen_on = false;
+                bsp_display_brightness_set(SCREEN_ON_BRIGHTNESS);
+                ESP_LOGI(TAG, "screen idle → screensaver (idle=%ums)", (unsigned)idle);
+            } else {                                // → off (blank)
+                s_screen_on = false;
+                bsp_display_brightness_set(0);
+                ESP_LOGI(TAG, "screen off (idle=%ums%s)", (unsigned)idle,
+                         s_force_off_armed ? ", PWR-off" : "");
+                if (s_power_cb) s_power_cb(false);  // gate light sleep on display state
+            }
         }
     }
 }

@@ -36,6 +36,10 @@ void  chat_ui_screen_power_start(int idle_timeout_s);
 // Update the screen blank timeout live (no task restart). 0 = always on; >0 = seconds. Used by the
 // boot config load; safe to call from any task.
 void  chat_ui_set_screen_timeout_s(int seconds);
+// Idle screensaver: when enabled, gently pulse the uploaded alarm image while idle (in place of
+// blanking) — 5s blank, fade in 5s, hold 5s, fade out 5s, repeat (20s cycle). Needs an alarm image
+// and a screen timeout > 0. Default off. Safe to call from any task.
+void  chat_ui_set_idle_anim_enabled(bool enabled);
 // Mark user/agent activity so the screen-power saver keeps the display awake. The UI mutators call
 // this internally; call it too from external input sources (e.g. button presses).
 void  chat_ui_note_activity(void);
