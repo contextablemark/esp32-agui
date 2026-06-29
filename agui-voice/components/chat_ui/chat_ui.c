@@ -309,23 +309,58 @@ static lv_obj_t         *s_idle_img;
 static lv_img_dsc_t      s_idle_dsc;                    // descriptor over s_idle_buf (must persist)
 static uint8_t          *s_idle_buf;                    // RGB565 pixels in PSRAM (freed when saver stops)
 static bool              s_idle_anim_enabled;           // config (NVS): idle screensaver on/off
+static lv_timer_t       *s_idle_timer;                  // drives the fade at a low rate (idle gaps)
+static uint32_t          s_idle_phase_ms;               // position within the 20 s cycle
+static int               s_idle_last_opa = -1;          // last opacity written (skip redundant redraws)
 
 void chat_ui_note_activity(void) { s_last_activity_ms = now_ms(); }
 
 // --- idle screensaver: gently pulse the uploaded image when idle (opt-in via the portal) ----------
-// Disabled by default. When enabled AND an alarm image is stored, the screen-power task shows this in
-// place of blanking: a centered image on black whose opacity LVGL animates — 5s blank, fade in 5s,
-// hold 5s, fade out 5s, repeat (a 20s cycle). The panel stays lit and the system stays awake (the
-// animation needs the CPU), so it deliberately does NOT trigger the battery light-sleep idle path.
-static void idle_anim_opa_cb(void *var, int32_t v)
+// Disabled by default; an attention attractor ("tradeshow mode"). When enabled AND an alarm image is
+// stored, the screen-power task shows this in place of blanking: a centered image on black whose
+// opacity a LOW-RATE lv_timer steps through 5s blank → 5s fade-in → 5s hold → 5s fade-out → repeat
+// (20s cycle). The step rate is deliberately low (~12 fps) so the priority-6 LVGL task gets idle gaps
+// and never monopolizes the recursive display mutex — a continuous lv_anim at the 4 ms refresh held
+// the lock back-to-back and starved the STT/UI/teardown tasks (the "Failed to acquire LVGL lock" /
+// "could not lock ws-client" storm). Runs on battery too: it keeps the device awake (no light sleep),
+// so it drains the battery — intentional for an always-on attractor.
+#define SAVER_STEP_MS   80                                  // opacity update cadence (~12.5 fps)
+#define SAVER_PHASE_MS  5000                                // each of: blank / fade-in / hold / fade-out
+#define SAVER_CYCLE_MS  (4 * SAVER_PHASE_MS)                // 20 s
+
+static void idle_saver_tick(lv_timer_t *t)
 {
-    lv_obj_set_style_img_opa((lv_obj_t *)var, (lv_opa_t)v, 0);
+    (void)t;
+    if (!s_idle_img) return;
+    s_idle_phase_ms += SAVER_STEP_MS;
+    if (s_idle_phase_ms >= SAVER_CYCLE_MS) s_idle_phase_ms -= SAVER_CYCLE_MS;
+    uint32_t p = s_idle_phase_ms;
+    lv_opa_t opa;
+    if      (p < SAVER_PHASE_MS)     opa = LV_OPA_TRANSP;                                       // blank
+    else if (p < 2 * SAVER_PHASE_MS) opa = (p - SAVER_PHASE_MS) * 255 / SAVER_PHASE_MS;         // fade in
+    else if (p < 3 * SAVER_PHASE_MS) opa = LV_OPA_COVER;                                        // hold
+    else                             opa = 255 - (p - 3 * SAVER_PHASE_MS) * 255 / SAVER_PHASE_MS; // fade out
+    if ((int)opa != s_idle_last_opa) {                      // skip redundant redraws during hold/blank
+        lv_obj_set_style_img_opa(s_idle_img, opa, 0);
+        s_idle_last_opa = (int)opa;
+    }
+}
+
+static void idle_anim_stop(void)
+{
+    if (!s_idle_overlay && !s_idle_buf) return;            // nothing allocated
+    if (bsp_display_lock(1000)) {
+        if (s_idle_timer)   { lv_timer_del(s_idle_timer); s_idle_timer = NULL; }
+        if (s_idle_overlay) { lv_obj_del(s_idle_overlay); s_idle_overlay = NULL; s_idle_img = NULL; }
+        if (s_idle_buf)     { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }  // after del → no live draw
+        bsp_display_unlock();
+    }
 }
 
 static bool idle_anim_start(void)
 {
-    if (s_idle_overlay) return true;                         // already running
-    if (!alarm_img_present() || alarm_img_load(&s_idle_buf) != ESP_OK) return false;  // no image → blank instead
+    if (s_idle_overlay) return true;                        // already running
+    if (!alarm_img_present() || alarm_img_load(&s_idle_buf) != ESP_OK) return false;  // no image → blank
     bool ok = false;
     if (bsp_display_lock(1000)) {
         s_idle_overlay = lv_obj_create(lv_scr_act());
@@ -349,36 +384,17 @@ static bool idle_anim_start(void)
         lv_obj_clear_flag(s_idle_img, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
         lv_obj_set_style_img_opa(s_idle_img, LV_OPA_TRANSP, 0);  // start blank
 
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, s_idle_img);
-        lv_anim_set_exec_cb(&a, idle_anim_opa_cb);
-        lv_anim_set_values(&a, LV_OPA_TRANSP, LV_OPA_COVER);     // 0 → 255 opacity
-        lv_anim_set_delay(&a, 5000);                             // start blank 5 s (first cycle too)
-        lv_anim_set_time(&a, 5000);                              // fade in over 5 s
-        lv_anim_set_playback_delay(&a, 5000);                    // hold at full intensity 5 s
-        lv_anim_set_playback_time(&a, 5000);                     // fade out over 5 s
-        lv_anim_set_repeat_delay(&a, 5000);                      // blank 5 s, then repeat → 20 s cycle
-        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);       // calm, eased ramp
-        lv_anim_start(&a);
-        ok = true;
+        s_idle_phase_ms = 0;                               // begin at the 5 s blank
+        s_idle_last_opa = -1;                              // force the first opacity write
+        s_idle_timer = lv_timer_create(idle_saver_tick, SAVER_STEP_MS, NULL);
+        ok = (s_idle_timer != NULL);
         bsp_display_unlock();
     }
-    if (!ok && s_idle_buf) { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }
+    if (!ok) {
+        if (s_idle_overlay) idle_anim_stop();              // partial start → full teardown
+        else if (s_idle_buf) { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }  // lock failed → free buf
+    }
     return ok;
-}
-
-static void idle_anim_stop(void)
-{
-    if (!s_idle_overlay) return;
-    if (bsp_display_lock(1000)) {
-        lv_anim_del(s_idle_img, idle_anim_opa_cb);
-        lv_obj_del(s_idle_overlay);                             // deletes the img child too
-        s_idle_overlay = NULL; s_idle_img = NULL;
-        if (s_idle_buf) { alarm_img_free(s_idle_buf); s_idle_buf = NULL; }  // after del → no live draw
-        bsp_display_unlock();
-    }
 }
 
 void chat_ui_set_idle_anim_enabled(bool enabled) { s_idle_anim_enabled = enabled; }
@@ -547,16 +563,17 @@ static void screen_power_task(void *arg)
         // there is nothing to gain by reading it. Keep one cheap, non-contending peek with a generous
         // timeout purely as a backstop, and on failure treat BUSY as activity (do not blank).
         uint32_t now = now_ms();
-        if (!s_screen_on || (now - s_last_activity_ms) >= (s_idle_timeout_ms - SCREEN_POLL_MS)) {
-            // Only near the blank threshold (or while already off) do we briefly try the lock, with a
-            // long timeout so it rarely fails; success refreshes touch idle, failure = LVGL busy = active.
+        // Skip the peek entirely while the screensaver is up — its own (throttled) redraws touch the
+        // lock, and touch activity is already stamped by the event hook, so the peek would only add
+        // contention / log spam. Otherwise: a brief, generous-timeout peek near the blank threshold.
+        if (!s_idle_overlay && (!s_screen_on || (now - s_last_activity_ms) >= (s_idle_timeout_ms - SCREEN_POLL_MS))) {
             if (bsp_display_lock(200)) {
                 uint32_t ti = lv_disp_get_inactive_time(NULL);
                 bsp_display_unlock();
                 if (ti < (now - s_last_activity_ms)) s_last_activity_ms = now - ti;   // touch is newer
-            } else if (!s_idle_overlay) {
+            } else {
                 s_last_activity_ms = now;   // LVGL busy → treat as activity, never blank mid-render
-            }   // during the screensaver a failed peek just retries next tick (don't false-wake)
+            }
         }
         uint32_t act_age = now - s_last_activity_ms;                  // ms since last activity of any kind
         uint32_t idle = act_age;
