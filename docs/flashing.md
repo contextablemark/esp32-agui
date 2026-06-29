@@ -12,12 +12,14 @@ chip:
 | Offset | Image | What it is |
 |---|---|---|
 | `0x0` | `bootloader/bootloader.bin` | 2nd-stage bootloader |
-| `0x8000` | `partition_table/partition-table.bin` | partition map (nvs / phy_init / 3 MB app) |
+| `0x8000` | `partition_table/partition-table.bin` | partition map (nvs / phy_init / 3 MB app / 256 KB alarmimg) |
 | `0x10000` | `agui_voice.bin` | the application |
 
 The partition map ([../agui-voice/partitions.csv](../agui-voice/partitions.csv)) places **`nvs` at
 `0x9000`** (right after the partition table). NVS is where the device stores your WiFi credentials,
-Soniox key, AG-UI URL + token, time zone, voice, and volume — so **don't overwrite it**.
+Soniox key, AG-UI URL + token, time zone, voice, volume, and screen settings — so **don't overwrite
+it**. The separate **`alarmimg`** partition (256 KB, at `0x310000`) holds the user-uploaded alarm
+graphic; it's written at runtime by the captive portal, never by the flasher.
 
 ## Normal flash + monitor
 
@@ -31,13 +33,17 @@ If `Connecting...` won't sync, force ROM download mode: **hold BOOT, tap RESET, 
 then retry. Monitor baud is 115200.
 
 > ⚠️ **Flash the app alone at `0x10000`** (`build/agui_voice.bin`) on subsequent reflashes.
-> Flashing a **merged** image at `0x0` (`build/agui_voice_merged.bin`) re-pads the `nvs` region
-> with `0xFF` and **wipes your saved WiFi/keys** — you'll have to re-provision via the
+> Flashing a **merged** image at `0x0` (`idf.py merge-bin` → `build/merged-binary.bin`) re-pads the
+> `nvs` region with `0xFF` and **wipes your saved WiFi/keys** — you'll have to re-provision via the
 > `AMOLED-setup` captive portal. App-only reflash keeps NVS intact:
 >
 > ```bash
 > esptool.py --chip esp32s3 -p <PORT> write_flash 0x10000 build/agui_voice.bin
 > ```
+>
+> **When the partition table changes** (e.g. the `alarmimg` partition was added), flash the table
+> once too — a full `idf.py flash` writes bootloader + `partition-table.bin`@`0x8000` + app and still
+> leaves `nvs`@`0x9000` untouched. After that, app-only reflashes are enough again.
 
 **Verify the running build** from the boot log's `ELF file SHA256:` line — the compile-time
 timestamp is stale on incremental builds, so the ELF hash is the reliable identity check.

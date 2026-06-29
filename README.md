@@ -15,8 +15,10 @@ agent as tools and ambient context.
 > chat + live-status UI, **spoken replies (streaming TTS with push-to-talk barge-in)**, **ambient
 > context** (time + battery + selected voice), the **`set_timer` client tool** (with an on-device
 > ringing alarm), a **captive-portal voice picker**, **volume buttons**, **eyes-free touch-to-talk**,
-> and **idle power saving** are all implemented and working on hardware. HITL interrupts and Soniox
-> ephemeral keys remain (see [Roadmap](#roadmap)).
+> a **user-uploadable alarm graphic**, a **configurable screen-blank timeout** (or always-on), an
+> **idle screensaver** that gently pulses the uploaded image, and **idle power saving** are all
+> implemented and working on hardware. HITL interrupts and Soniox ephemeral keys remain (see
+> [Roadmap](#roadmap)).
 
 ```
 mic ─ES8311/I²S(16k s16le)─▶ Soniox STT (streaming WSS) ─▶ live transcript
@@ -89,7 +91,7 @@ esp32-agui/
 │   ├── main/                    ← app entry + push-to-talk turn state machine
 │   ├── components/              ← first-party components (below) + vendored board BSP/drivers
 │   ├── sdkconfig.defaults       ← target esp32s3, TLS 1.3, PSRAM, power mgmt, LVGL config
-│   └── partitions.csv
+│   └── partitions.csv           ← nvs · 3 MB app · 256 KB "alarmimg" (uploaded alarm graphic)
 ├── docs/
 │   ├── agui-voice-plan.md       ← full design: components, APIs, state machine, build phases
 │   ├── flashing.md              ← flash workflow + NVS-wipe recovery
@@ -107,9 +109,10 @@ esp32-agui/
 | [`agui_sdk`](agui-voice/components/agui_sdk/) | Vendored + ESP-ported community C++ AG-UI SDK (streaming SSE parser, event router) |
 | [`soniox_client`](agui-voice/components/soniox_client/) | ES8311 mic capture → Soniox WSS streaming STT → partial/final transcript callbacks |
 | [`soniox_tts_client`](agui-voice/components/soniox_tts_client/) | Reply text → Soniox WSS streaming TTS → PCM → ES8311 speaker (cancelable for barge-in) |
-| [`chat_ui`](agui-voice/components/chat_ui/) | LVGL chat bubbles, ephemeral status line, touch-to-talk, screen power saver, ringing-alarm overlay |
-| [`net_prov`](agui-voice/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning (incl. voice/TZ) |
-| [`app_cfg`](agui-voice/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer, TZ, voice, volume) |
+| [`chat_ui`](agui-voice/components/chat_ui/) | LVGL chat bubbles, status line, touch-to-talk, configurable screen power saver, ringing-alarm overlay (uploaded graphic), idle screensaver |
+| [`net_prov`](agui-voice/components/net_prov/) | Multi-SSID WiFi connect + auto-reconnect + SoftAP captive-portal provisioning (keys/TZ/voice/timeout + alarm-image upload) |
+| [`alarm_img`](agui-voice/components/alarm_img/) | Store/load the user-uploaded alarm graphic (240×240 RGB565) in a dedicated flash partition, staged via PSRAM |
+| [`app_cfg`](agui-voice/components/app_cfg/) | Tiny NVS-backed config/secret store (Soniox key, AG-UI URL + bearer, TZ, voice, volume, screen timeout, idle-anim flag) |
 | [`device_tools`](agui-voice/components/device_tools/) | Ambient context (battery/time/voice) + client-tool registry (`set_timer`) |
 | [`esp32_s3_touch_amoled_1_8`](agui-voice/components/esp32_s3_touch_amoled_1_8/) | Board BSP (display/touch/audio bring-up); vendored from the Waveshare LVGL example |
 | `board_variant`, `esp_lcd_*`, `espressif__*` | Vendored display/touch drivers + ESP component-registry deps |
@@ -162,9 +165,12 @@ idf.py -p <PORT> flash monitor
 port doesn't enumerate, hold **BOOT**, tap **RESET**, then release **BOOT** to force ROM
 download mode.
 
-> ⚠️ **Flash the app alone at `0x10000`** (`build/agui_voice.bin`). Flashing a *merged* image at
-> `0x0` pads the NVS region (0x9000) with `0xFF` and **wipes your saved WiFi/keys**. See
-> [docs/flashing.md](docs/flashing.md) for the recovery procedure and download-mode entry.
+> ⚠️ **Routine reflash = app alone at `0x10000`** (`build/agui_voice.bin`) — it leaves NVS intact.
+> Flashing a *merged* image at `0x0` pads the NVS region (`0x9000`) with `0xFF` and **wipes your
+> saved WiFi/keys**. When the **partition table changes** (e.g. the `alarmimg` partition was added),
+> flash it once too: a normal `idf.py flash` writes bootloader + partition-table (`0x8000`) + app and
+> still leaves `nvs` untouched. See [docs/flashing.md](docs/flashing.md) for the recovery procedure
+> and download-mode entry.
 
 **Verify the running build** from the boot log's `ELF file SHA256:` line — the compile-time
 timestamp is stale on incremental builds, so the ELF hash is the reliable identity check.
@@ -190,6 +196,10 @@ are not emulated. Useful for boot / app-logic / networking, not the UI.
    - **AG-UI endpoint URL** (+ optional bearer token)
    - **Time zone** (POSIX `TZ` string, for the agent's ambient time context)
    - **TTS voice** (dropdown of the 28 Soniox `tts-rt-v1` voices; default **Adrian**)
+   - **Screen blank timeout** (seconds; default 60, `0` = always on)
+   - **Idle animation** (checkbox; gently pulse the uploaded alarm image when idle)
+   - **Alarm image** (file picker; any image is cropped in-browser to 240×240, converted to
+     RGB565, and uploaded — no on-device decode)
 
    Only the fields you fill in are overwritten; the confirmation page echoes the saved values.
    Everything is stored in NVS, and the device connects.
@@ -208,11 +218,15 @@ are not emulated. Useful for boot / app-logic / networking, not the UI.
    endpoint / keys / voice / time zone without reflashing.
 
 5. **Tools & alarms.** When the agent calls `set_timer`, the device runs an idle countdown and then
-   **rings** — an escalating beep with a flashing red-ring overlay; **tap the screen to dismiss**.
+   **rings** — an escalating beep with a full-screen alert; **tap the screen to dismiss**. The alert
+   shows your **uploaded alarm graphic** (pulsing) if one is set, otherwise a flashing red ring.
 
-The display **blanks after 60 s of inactivity** to save power and **wakes on any touch or button
-press**. On battery, idle also sheds WiFi + codec and drops the CPU into light sleep; the next turn
-reconnects (typically 1–3 s on first wake). A long PWR-key hold powers the device off (AXP2101).
+The display **blanks after a configurable timeout** (default 60 s, or `0` = always on) to save power
+and **wakes on any touch or button press**. With **idle animation** enabled (and an alarm image
+uploaded), it instead shows a calm screensaver that pulses the image — 5 s blank → 5 s fade-in →
+5 s full → 5 s fade-out, looping. On battery, plain blanking also sheds WiFi + codec and drops the
+CPU into light sleep (the next turn reconnects in ~1–3 s); the screensaver keeps the device awake, so
+it's best on USB power. A long PWR-key hold powers the device off (AXP2101).
 
 Configuration and secrets are stored in NVS (`appcfg` namespace for the Soniox key / AG-UI URL +
 token / TZ / voice / volume; `netprov` for WiFi). Soniox **ephemeral keys** (mint-on-demand) are
@@ -233,7 +247,8 @@ planned (see Roadmap).
 | **P5** Context | ambient battery + local time + selected voice → per-run `context` | ✅ |
 | **P7** Tools | `set_timer` (idle countdown → ringing alarm) round-trip | ✅ |
 | **TTS** Spoken replies | `soniox_tts_client`: streaming reply audio + barge-in | ✅ |
-| — UX | voice picker, volume buttons, eyes-free touch-to-talk, screen/idle power saving | ✅ |
+| — UX | voice picker, volume buttons, eyes-free touch-to-talk, uploadable alarm graphic, configurable screen timeout, idle screensaver | ✅ |
+| — Latency | CPU pinned to 240 MHz per turn (faster TLS handshakes) | ✅ |
 | **P6** Interrupt | detect HITL → render-by-`response_schema` → resume; `show_qr` | ◻ planned |
 | **P8** Hardening | Soniox ephemeral keys, reconnect/backoff, PSRAM tuning, error states | ◻ planned |
 

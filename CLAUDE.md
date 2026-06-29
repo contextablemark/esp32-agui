@@ -123,11 +123,14 @@ mic → ES8311/I²S (16k s16le) → Soniox WSS (streaming) → transcript
 ```
 No barge-in (single ES8311, no echo reference) → wake/PTT turn-taking.
 
-**Components (ESP-IDF):** `soniox_client/` (STT over `esp_websocket_client`) · `agui_client/`
-(AG-UI client **ported from `ag-ui-protocol/ag-ui/sdks/community/c++`**: swap libcurl→`esp_http_client`,
-nlohmann→cJSON, hand-roll RFC 6902; +3 device extensions — per-run `context`, Interrupt→resume,
-client-tool dispatch) · `device_tools/` (tools + ambient context from QMI8658/AXP2101/PCF85063) ·
-`chat_ui/` (LVGL chat + status + interrupt + idle timer).
+**Components (ESP-IDF):** `soniox_client/` (STT over `esp_websocket_client`) · `soniox_tts_client/`
+(streaming spoken replies + PTT barge-in) · `agui_sdk/` + `agui_client/` (AG-UI client — **vendors +
+ESP-ports `ag-ui-protocol/ag-ui/sdks/community/c++`**: libcurl→`esp_http_client`, nlohmann→cJSON;
++device extensions — per-run `context`, REASONING_*, Interrupt→resume, client-tool dispatch;
+`agui_client` is a thin `extern "C"` shim) · `device_tools/` (tools + ambient context from
+QMI8658/AXP2101/PCF85063) · `net_prov/` (WiFi + SoftAP captive portal) · `app_cfg/` (NVS config) ·
+`alarm_img/` (user-uploaded alarm graphic in a flash partition) · `chat_ui/` (LVGL chat + status +
+configurable screen saver + ringing-alarm overlay + idle screensaver of the uploaded image).
 
 **v1 surface:** ambient `context` (motion+battery+time, read-only) · Interrupt/HITL
 (`response_schema`-driven touch prompt, resume) · tools `set_timer` (idle countdown) /
